@@ -13,10 +13,11 @@
     "windows": [
       {
         "title": "CarryBox",
-        "width": 1100,
-        "height": 720,
-        "minWidth": 880,
-        "minHeight": 560
+        "width": 1200,
+        "height": 780,
+        "minWidth": 860,
+        "minHeight": 560,
+        "center": true
       }
     ],
     "security": {

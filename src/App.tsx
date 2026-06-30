@@ -165,10 +165,10 @@ export default function App() {
           <span className="text-lg font-semibold text-sky-400">CarryBox</span>
           <span className="text-xs text-slate-400">· Descargar · SFTP · FTP · FTPS</span>
         </div>
-        <div className="flex flex-wrap items-end gap-2">
-          <Field label="Protocolo">
+        <div className="flex items-end gap-2">
+          <Field label="Protocolo" className="shrink-0">
             <select
-              className="select w-56"
+              className="select w-60"
               value={protocol}
               onChange={(e) => changeProtocol(e.target.value as Protocol)}
               disabled={connected}
@@ -178,33 +178,33 @@ export default function App() {
               <option value="ftps">FTPS (cifrado)</option>
             </select>
           </Field>
-          <Field label="Servidor (host)">
+          <Field label="Servidor (host)" className="min-w-0 flex-2">
             <input
-              className="input w-52"
+              className="input w-full"
               value={host}
               placeholder="midominio.com o IP"
               onChange={(e) => setHost(e.target.value)}
               disabled={connected}
             />
           </Field>
-          <Field label="Usuario">
+          <Field label="Usuario" className="min-w-0 flex-1">
             <input
-              className="input w-36"
+              className="input w-full"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               disabled={connected}
             />
           </Field>
-          <Field label="Contrasena">
+          <Field label="Contrasena" className="min-w-0 flex-1">
             <input
               type="password"
-              className="input w-36"
+              className="input w-full"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               disabled={connected}
             />
           </Field>
-          <Field label="Puerto">
+          <Field label="Puerto" className="shrink-0">
             <input
               type="number"
               className="input w-20"
@@ -213,22 +213,24 @@ export default function App() {
               disabled={connected}
             />
           </Field>
-          {!connected ? (
-            <button className="btn btn-primary" onClick={connect} disabled={busy}>
-              {busy ? "Conectando..." : "Conectar"}
+          <div className="flex shrink-0 items-end gap-2">
+            {!connected ? (
+              <button className="btn btn-primary w-36" onClick={connect} disabled={busy}>
+                {busy ? "Conectando..." : "Conectar"}
+              </button>
+            ) : (
+              <button className="btn btn-danger w-36" onClick={disconnect}>
+                Desconectar
+              </button>
+            )}
+            <button
+              className="btn btn-secondary w-28"
+              onClick={() => setShowAdvanced((v) => !v)}
+              title="Opciones avanzadas"
+            >
+              {showAdvanced ? "▾ Avanzado" : "▸ Avanzado"}
             </button>
-          ) : (
-            <button className="btn btn-danger" onClick={disconnect}>
-              Desconectar
-            </button>
-          )}
-          <button
-            className="btn btn-secondary"
-            onClick={() => setShowAdvanced((v) => !v)}
-            title="Opciones avanzadas"
-          >
-            {showAdvanced ? "▾ Avanzado" : "▸ Avanzado"}
-          </button>
+          </div>
         </div>
 
         {/* Opciones avanzadas */}
@@ -335,9 +337,17 @@ export default function App() {
 
 // ---- Componentes auxiliares ----
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({
+  label,
+  children,
+  className = "",
+}: {
+  label: string;
+  children: React.ReactNode;
+  className?: string;
+}) {
   return (
-    <label className="flex flex-col gap-1 text-xs text-slate-400">
+    <label className={`flex flex-col gap-1 text-xs text-slate-400 ${className}`}>
       {label}
       {children}
     </label>

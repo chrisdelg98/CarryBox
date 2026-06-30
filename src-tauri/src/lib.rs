@@ -4,7 +4,7 @@ use remote::{ConnConfig, FtpSource, RemoteEntry, RemoteSource, SftpSource};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Conexion remota activa (la del modo Descargar). `None` mientras no se conecta.
 /// Se guarda detras de Arc<Mutex> para compartirla entre los comandos async,
@@ -245,6 +245,19 @@ pub fn run() {
         .setup(|app| {
             if let Ok(mut g) = LOGGER.app.lock() {
                 *g = Some(app.handle().clone());
+            }
+            // Tamano adaptable: abrir al ~80% de la pantalla (centrada, no
+            // maximizada), con limites para que se vea bien en cualquier monitor.
+            if let Some(win) = app.get_webview_window("main") {
+                if let Ok(Some(monitor)) = win.primary_monitor() {
+                    let sz = monitor.size();
+                    let w = ((sz.width as f64) * 0.80).round() as u32;
+                    let h = ((sz.height as f64) * 0.85).round() as u32;
+                    let w = w.clamp(1024, 1600);
+                    let h = h.clamp(640, 1000);
+                    let _ = win.set_size(tauri::PhysicalSize::new(w, h));
+                    let _ = win.center();
+                }
             }
             Ok(())
         })
