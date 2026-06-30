@@ -1,6 +1,6 @@
 mod remote;
 
-use remote::{ConnConfig, FtpSource, RemoteEntry, RemoteSource};
+use remote::{ConnConfig, FtpSource, RemoteEntry, RemoteSource, SftpSource};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -90,16 +90,17 @@ async fn remote_connect(
         &app,
         "status",
         format!(
-            "Conectando a {}:{}{} ...",
+            "Conectando a {}:{} por {} ...",
             config.host,
             config.port,
-            if config.secure { " (FTPS)" } else { "" }
+            config.protocol.to_uppercase()
         ),
     );
     tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
         let mut src: Box<dyn RemoteSource> = match config.protocol.as_str() {
-            "ftp" => Box::new(FtpSource::new()),
-            other => return Err(format!("Protocolo aun no soportado: {other}")),
+            "ftp" | "ftps" => Box::new(FtpSource::new()),
+            "sftp" => Box::new(SftpSource::new()?),
+            other => return Err(format!("Protocolo no soportado: {other}")),
         };
         match src.connect(&config) {
             Ok(()) => emit(&app, "status", "Sesion iniciada (login correcto)."),

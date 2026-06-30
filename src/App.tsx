@@ -55,13 +55,22 @@ const LOG_STYLE: Record<LogKind, { label: string; cls: string }> = {
 
 export default function App() {
   // --- Conexion ---
+  type Protocol = "sftp" | "ftp" | "ftps";
+  const [protocol, setProtocol] = useState<Protocol>("sftp");
   const [host, setHost] = useState("");
-  const [port, setPort] = useState(21);
+  const [port, setPort] = useState(22);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [secure, setSecure] = useState(true); // FTPS por defecto (lo mas comun hoy)
+  const [passive, setPassive] = useState(true); // modo pasivo FTP (avanzado)
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
+
+  // Al cambiar de protocolo, ajustar el puerto por defecto (22 SFTP / 21 FTP).
+  function changeProtocol(p: Protocol) {
+    setProtocol(p);
+    setPort(p === "sftp" ? 22 : 21);
+  }
 
   // --- Paneles ---
   const [localDir, setLocalDir] = useState<LocalDir | null>(null);
@@ -113,7 +122,7 @@ export default function App() {
     setBusy(true);
     try {
       const cwd = await invoke<string>("remote_connect", {
-        config: { protocol: "ftp", host, port, username, password, secure },
+        config: { protocol, host, port, username, password, passive },
       });
       setConnected(true);
       await openRemote(cwd || "/");
@@ -157,11 +166,23 @@ export default function App() {
           <span className="text-xs text-slate-400">· Descargar · FTP / FTPS (estilo FileZilla)</span>
         </div>
         <div className="flex flex-wrap items-end gap-2">
+          <Field label="Protocolo">
+            <select
+              className="input w-40"
+              value={protocol}
+              onChange={(e) => changeProtocol(e.target.value as Protocol)}
+              disabled={connected}
+            >
+              <option value="sftp">SFTP (SSH) · recomendado</option>
+              <option value="ftp">FTP</option>
+              <option value="ftps">FTPS (FTP cifrado)</option>
+            </select>
+          </Field>
           <Field label="Servidor (host)">
             <input
               className="input w-52"
               value={host}
-              placeholder="ftp.midominio.com o IP"
+              placeholder="midominio.com o IP"
               onChange={(e) => setHost(e.target.value)}
               disabled={connected}
             />
@@ -192,15 +213,6 @@ export default function App() {
               disabled={connected}
             />
           </Field>
-          <label className="flex items-center gap-1.5 pb-1.5 text-xs text-slate-300">
-            <input
-              type="checkbox"
-              checked={secure}
-              onChange={(e) => setSecure(e.target.checked)}
-              disabled={connected}
-            />
-            FTPS (cifrado)
-          </label>
           {!connected ? (
             <button className="btn btn-primary" onClick={connect} disabled={busy}>
               {busy ? "Conectando..." : "Conectar"}
@@ -210,7 +222,35 @@ export default function App() {
               Desconectar
             </button>
           )}
+          <button
+            className="btn-mini self-end pb-1.5"
+            onClick={() => setShowAdvanced((v) => !v)}
+            title="Opciones avanzadas"
+          >
+            {showAdvanced ? "▾ Avanzado" : "▸ Avanzado"}
+          </button>
         </div>
+
+        {/* Opciones avanzadas */}
+        {showAdvanced && (
+          <div className="mt-2 flex flex-wrap items-center gap-4 border-t border-slate-700 pt-2 text-xs text-slate-300">
+            {protocol === "sftp" ? (
+              <span className="text-slate-500">
+                SFTP usa una sola conexion (puerto 22); no necesita modo pasivo.
+              </span>
+            ) : (
+              <label className="flex items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={passive}
+                  onChange={(e) => setPassive(e.target.checked)}
+                  disabled={connected}
+                />
+                Modo pasivo (recomendado tras NAT/router)
+              </label>
+            )}
+          </div>
+        )}
       </header>
 
       {/* Panel doble */}

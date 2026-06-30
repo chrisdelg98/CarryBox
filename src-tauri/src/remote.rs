@@ -8,18 +8,22 @@
 use serde::{Deserialize, Serialize};
 use std::time::UNIX_EPOCH;
 
+fn default_true() -> bool {
+    true
+}
+
 /// Datos de conexion que llegan desde la UI.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConnConfig {
-    /// "ftp" por ahora; luego "sftp", "rsync"...
+    /// "sftp" | "ftp" | "ftps"
     pub protocol: String,
     pub host: String,
     pub port: u16,
     pub username: String,
     pub password: String,
-    /// FTPS explicito (aun no implementado). Reservado para no romper la API.
-    #[serde(default)]
-    pub secure: bool,
+    /// Modo pasivo (solo FTP/FTPS). Por defecto activado.
+    #[serde(default = "default_true")]
+    pub passive: bool,
 }
 
 /// Un elemento dentro de una carpeta remota.
@@ -71,8 +75,8 @@ impl RemoteSource for FtpSource {
         let mut ftp =
             Ftp::connect(&addr).map_err(|e| format!("No se pudo conectar a {addr}: {e}"))?;
 
-        // FTPS explicito (AUTH TLS) si el usuario lo pide.
-        if cfg.secure {
+        // FTPS explicito (AUTH TLS) si el protocolo es "ftps".
+        if cfg.protocol == "ftps" {
             // Aceptamos certificados invalidos: muchos hosts usan IP o cert
             // autofirmado. Es comodo para el usuario final; revisarlo si algun
             // dia queremos verificacion estricta opcional.
@@ -90,10 +94,14 @@ impl RemoteSource for FtpSource {
 
         ftp.login(&cfg.username, &cfg.password)
             .map_err(|e| format!("Login fallo (usuario/clave?): {e}"))?;
-        // Passive: imprescindible cuando el cliente esta detras de NAT/router.
-        ftp.set_mode(Mode::Passive);
-        // Si el server anuncia una IP equivocada en PASV, usar la del control.
-        ftp.set_passive_nat_workaround(true);
+        if cfg.passive {
+            // Passive: lo normal cuando el cliente esta detras de NAT/router.
+            ftp.set_mode(Mode::Passive);
+            // Si el server anuncia una IP equivocada en PASV, usar la del control.
+            ftp.set_passive_nat_workaround(true);
+        } else {
+            ftp.set_mode(Mode::Active);
+        }
         self.stream = Some(ftp);
         Ok(())
     }
@@ -146,6 +154,151 @@ impl RemoteSource for FtpSource {
         // control esta medio muerto (p.ej. tras un timeout de datos) se cuelga
         // sin limite. Para un boton "Desconectar" preferimos cierre instantaneo.
         self.stream = None;
+        Ok(())
+    }
+}
+
+/// Carpetas primero, luego por nombre (como FileZilla).
+fn sort_entries(entries: &mut [RemoteEntry]) {
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
+// ---------------------------------------------------------------------------
+// SftpSource — proveedor SSH/SFTP (russh + russh-sftp, Rust puro).
+//
+// SFTP usa UNA sola conexion (puerto 22), sin canal de datos separado: por eso
+// NO sufre el bloqueo de puertos pasivos que rompe el FTP en muchos servers.
+// russh es async; como el trait RemoteSource es sync (se ejecuta dentro de
+// spawn_blocking), cada operacion usa un runtime tokio propio con block_on.
+// ---------------------------------------------------------------------------
+
+use russh::client;
+use russh::keys::ssh_key::PublicKey;
+use russh_sftp::client::SftpSession;
+use tokio::runtime::Runtime;
+
+/// Handler SSH minimo: aceptamos cualquier host key (mejorable luego con
+/// known_hosts / confirmacion del usuario).
+struct SshHandler;
+
+impl client::Handler for SshHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(&mut self, _key: &PublicKey) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
+
+pub struct SftpSource {
+    rt: Runtime,
+    sftp: Option<SftpSession>,
+    // Mantiene viva la sesion SSH mientras dure la conexion.
+    _session: Option<client::Handle<SshHandler>>,
+}
+
+impl SftpSource {
+    pub fn new() -> Result<Self, String> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(|e| format!("No se pudo crear el runtime async: {e}"))?;
+        Ok(Self {
+            rt,
+            sftp: None,
+            _session: None,
+        })
+    }
+}
+
+impl RemoteSource for SftpSource {
+    fn connect(&mut self, cfg: &ConnConfig) -> Result<(), String> {
+        let host = cfg.host.clone();
+        let port = cfg.port;
+        let user = cfg.username.clone();
+        let pass = cfg.password.clone();
+
+        let (session, sftp) = self.rt.block_on(async move {
+            let config = std::sync::Arc::new(client::Config::default());
+            let mut session = client::connect(config, (host.as_str(), port), SshHandler)
+                .await
+                .map_err(|e| format!("No se pudo conectar por SSH a {host}:{port}: {e}"))?;
+
+            let auth = session
+                .authenticate_password(&user, &pass)
+                .await
+                .map_err(|e| format!("Error de autenticacion SSH: {e}"))?;
+            if !auth.success() {
+                return Err("Autenticacion SSH fallida (usuario/clave?)".to_string());
+            }
+
+            let channel = session
+                .channel_open_session()
+                .await
+                .map_err(|e| format!("No se pudo abrir el canal SSH: {e}"))?;
+            channel
+                .request_subsystem(true, "sftp")
+                .await
+                .map_err(|e| format!("El server no acepto el subsistema SFTP: {e}"))?;
+            let sftp = SftpSession::new(channel.into_stream())
+                .await
+                .map_err(|e| format!("No se pudo iniciar SFTP: {e}"))?;
+
+            Ok::<_, String>((session, sftp))
+        })?;
+
+        self._session = Some(session);
+        self.sftp = Some(sftp);
+        Ok(())
+    }
+
+    fn pwd(&mut self) -> Result<String, String> {
+        let sftp = self.sftp.as_ref().ok_or("No conectado")?;
+        self.rt.block_on(async {
+            sftp.canonicalize(".")
+                .await
+                .map_err(|e| format!("No se pudo obtener la carpeta inicial: {e}"))
+        })
+    }
+
+    fn list_dir(&mut self, path: &str) -> Result<Vec<RemoteEntry>, String> {
+        let sftp = self.sftp.as_ref().ok_or("No conectado")?;
+        let target = if path.is_empty() { "." } else { path };
+
+        let mut entries = self.rt.block_on(async {
+            let rd = sftp
+                .read_dir(target)
+                .await
+                .map_err(|e| format!("No se pudo listar la carpeta: {e}"))?;
+            let mut out = Vec::new();
+            for entry in rd {
+                let name = entry.file_name();
+                if name == "." || name == ".." {
+                    continue;
+                }
+                let meta = entry.metadata();
+                out.push(RemoteEntry {
+                    name,
+                    is_dir: meta.is_dir(),
+                    size: meta.size.unwrap_or(0),
+                    modified: meta.mtime.map(|m| m as u64),
+                });
+            }
+            Ok::<_, String>(out)
+        })?;
+
+        sort_entries(&mut entries);
+        Ok(entries)
+    }
+
+    fn disconnect(&mut self) -> Result<(), String> {
+        // Soltar la sesion cierra el socket de inmediato.
+        self.sftp = None;
+        self._session = None;
         Ok(())
     }
 }

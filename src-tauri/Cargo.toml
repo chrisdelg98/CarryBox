@@ -30,4 +30,12 @@ suppaftp = { version = "6", features = ["native-tls"] }
 native-tls = "0.2"
 # Para transmitir al log de la UI los comandos/respuestas FTP que suppaftp registra.
 log = "0.4"
+# SFTP (modo Descargar - proveedor SftpSource). Cliente SSH/SFTP en Rust puro,
+# sin OpenSSL ni binarios externos (requisito del plan). Una sola conexion (puerto
+# 22), sin canal de datos separado -> sin el problema de puertos pasivos del FTP.
+# Backend cripto "ring": en Windows trae objetos precompilados y NO necesita
+# NASM (a diferencia del default aws-lc-rs). Mantiene el build sin herramientas extra.
+russh = { version = "0.61", default-features = false, features = ["ring"] }
+russh-sftp = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
 
