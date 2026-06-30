@@ -529,6 +529,7 @@ export default function App() {
       <div className="flex min-h-0 flex-1">
         <Pane
           title="Local (tu PC)"
+          side="local"
           onDrop={() => onDropTo("local")}
           onContextMenu={(e) => onRowContextMenu(e, "local", null)}
         >
@@ -547,6 +548,7 @@ export default function App() {
 
         <Pane
           title="Remoto (servidor)"
+          side="remote"
           onDrop={() => onDropTo("remote")}
           onContextMenu={(e) => connected && onRowContextMenu(e, "remote", null)}
         >
@@ -810,23 +812,35 @@ function Field({
 
 function Pane({
   title,
+  side,
   children,
   onDrop,
   onContextMenu,
 }: {
   title: string;
+  side: Side;
   children: React.ReactNode;
   onDrop: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
 }) {
   const [over, setOver] = useState(false);
+  // Solo se permite soltar si el origen es el OTRO panel.
+  const allowDrop = () => !!dragData && dragData.side !== side;
   return (
     <section
       className={`flex min-w-0 flex-1 flex-col border-r border-slate-700 last:border-r-0 ${
         over ? "bg-sky-500/5 ring-2 ring-inset ring-sky-500/40" : ""
       }`}
+      onDragEnter={(e) => {
+        if (allowDrop()) e.preventDefault();
+      }}
       onDragOver={(e) => {
+        if (!allowDrop()) {
+          e.dataTransfer.dropEffect = "none";
+          return;
+        }
         e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
         setOver(true);
       }}
       onDragLeave={() => setOver(false)}
@@ -896,8 +910,10 @@ function FileTable({
                 <tr
                   key={r.path}
                   draggable
-                  onDragStart={() => {
+                  onDragStart={(e) => {
                     dragData = { side, items: [r] };
+                    e.dataTransfer.effectAllowed = "copy";
+                    e.dataTransfer.setData("text/plain", r.name);
                   }}
                   onClick={() => setSelected(r.path)}
                   onDoubleClick={() => onOpen(r)}
