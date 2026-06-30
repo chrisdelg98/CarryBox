@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
+
+const REPO_URL = "https://github.com/chrisdelg98/CarryBox";
 
 // ---- Tipos que reflejan el backend Rust ----
 type RemoteEntry = { name: string; is_dir: boolean; size: number; modified: number | null };
@@ -418,9 +421,20 @@ export default function App() {
     <div className="flex h-full flex-col bg-slate-900 text-slate-200">
       {/* Barra superior */}
       <header className="border-b border-slate-700 bg-slate-800 px-4 py-2">
-        <div className="mb-2 flex items-center gap-2">
-          <span className="text-lg font-semibold text-sky-400">CarryBox</span>
-          <span className="text-xs text-slate-400">· Descargar · SFTP · FTP · FTPS</span>
+        <div className="mb-2 flex items-center gap-2.5">
+          <Logo className="h-7 w-7 shrink-0" />
+          <span className="bg-linear-to-r from-sky-400 to-cyan-300 bg-clip-text text-xl font-bold tracking-tight text-transparent">
+            CarryBox
+          </span>
+          <span className="text-[11px] leading-none text-slate-300">by Christian Arévalo</span>
+          <span className="ml-1 text-xs text-slate-400">· SFTP · FTP · FTPS</span>
+          <button
+            className="ml-auto text-slate-400 transition-colors hover:text-slate-100"
+            onClick={() => openUrl(REPO_URL).catch(() => {})}
+            title="Ver repositorio en GitHub"
+          >
+            <Icon name="github" className="h-5 w-5" />
+          </button>
         </div>
         <div className="flex items-end gap-2">
           <Field label="Protocolo" className="shrink-0">
@@ -744,9 +758,35 @@ function Icon({ name, className = "h-4 w-4" }: { name: string; className?: strin
           <path d="M14 2v6h6" />
         </svg>
       );
+    case "github":
+      return (
+        <svg viewBox="0 0 24 24" fill="currentColor" className={className} aria-hidden="true">
+          <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12" />
+        </svg>
+      );
     default:
       return <svg {...p} />;
   }
+}
+
+// ---- Logo de CarryBox (mini caja, mismo diseno que el icono de la app) ----
+function Logo({ className = "h-7 w-7" }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+      <path
+        d="M17.5777 4.43152L15.5777 3.38197C13.8221 2.46066 12.9443 2 12 2C11.0557 2 10.1779 2.46066 8.42229 3.38197L6.42229 4.43152C4.64855 5.36234 3.6059 5.9095 2.95969 6.64132L12 11.1615L21.0403 6.64132C20.3941 5.9095 19.3515 5.36234 17.5777 4.43152Z"
+        fill="#e8f5ff"
+      />
+      <path
+        d="M21.7484 7.96435L12.75 12.4635V21.904C13.4679 21.7252 14.2848 21.2965 15.5777 20.618L17.5777 19.5685C19.7294 18.4393 20.8052 17.8748 21.4026 16.8603C22 15.8458 22 14.5833 22 12.0585V11.9415C22 10.0489 22 8.86558 21.7484 7.96435Z"
+        fill="#0284c7"
+      />
+      <path
+        d="M11.25 21.904V12.4635L2.25164 7.96434C2 8.86557 2 10.0489 2 11.9415V12.0585C2 14.5833 2 15.8458 2.5974 16.8603C3.19479 17.8748 4.27063 18.4393 6.42229 19.5685L8.42229 20.618C9.71524 21.2965 10.5321 21.7252 11.25 21.904Z"
+        fill="#38bdf8"
+      />
+    </svg>
+  );
 }
 
 // ---- Componentes auxiliares ----
