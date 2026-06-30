@@ -125,15 +125,14 @@ export default function App() {
     }
   }
 
-  async function disconnect() {
-    try {
-      await invoke("remote_disconnect");
-    } catch (e) {
-      addLog("error", `${e}`);
-    }
+  function disconnect() {
+    // UI optimista: liberamos la pantalla de inmediato y cerramos por detras,
+    // asi el boton nunca se ve "colgado" aunque la red tarde.
     setConnected(false);
     setRemoteEntries([]);
     setRemotePath("/");
+    setBusy(false);
+    invoke("remote_disconnect").catch((e) => addLog("error", `${e}`));
   }
 
   async function openRemote(path: string) {

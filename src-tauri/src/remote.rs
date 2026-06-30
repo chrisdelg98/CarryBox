@@ -141,9 +141,11 @@ impl RemoteSource for FtpSource {
     }
 
     fn disconnect(&mut self) -> Result<(), String> {
-        if let Some(mut ftp) = self.stream.take() {
-            let _ = ftp.quit();
-        }
+        // Cerrar de inmediato soltando el stream (eso cierra el socket TCP).
+        // NO usamos quit(): manda QUIT y espera la respuesta del server, y si el
+        // control esta medio muerto (p.ej. tras un timeout de datos) se cuelga
+        // sin limite. Para un boton "Desconectar" preferimos cierre instantaneo.
+        self.stream = None;
         Ok(())
     }
 }
