@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+@layer components {
+  .input {
+    @apply rounded border border-slate-600 bg-slate-900 px-2 py-1 text-sm text-slate-100
+      outline-none focus:border-sky-500 disabled:opacity-50;
+  }
+  .btn {
+    @apply rounded px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply bg-sky-600 text-white hover:bg-sky-500;
+  }
+  .btn-danger {
+    @apply bg-rose-600 text-white hover:bg-rose-500;
+  }
+  .btn-mini {
+    @apply rounded border border-slate-600 bg-slate-700 px-2 text-xs text-slate-200
+      hover:bg-slate-600 disabled:opacity-40;
+  }
+}
