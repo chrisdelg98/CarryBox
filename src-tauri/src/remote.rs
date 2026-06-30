@@ -6,7 +6,12 @@
 //! trait, sin tocar el resto (mismo principio que `SecretStore` para multi-SO).
 
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::path::Path;
 use std::time::UNIX_EPOCH;
+
+/// Callback de progreso: recibe el total de bytes transferidos hasta ahora.
+pub type ProgressFn<'a> = dyn FnMut(u64) + 'a;
 
 fn default_true() -> bool {
     true
@@ -37,12 +42,34 @@ pub struct RemoteEntry {
 }
 
 /// Contrato comun de cualquier proveedor remoto del modo Descargar.
+/// Las operaciones trabajan a nivel de UN archivo / UNA carpeta; la recursion
+/// (bajar/subir carpetas enteras) la orquesta lib.rs usando list_dir + estas.
 pub trait RemoteSource: Send {
     fn connect(&mut self, cfg: &ConnConfig) -> Result<(), String>;
     /// Directorio de trabajo actual tras conectar.
     fn pwd(&mut self) -> Result<String, String>;
     fn list_dir(&mut self, path: &str) -> Result<Vec<RemoteEntry>, String>;
     fn disconnect(&mut self) -> Result<(), String>;
+
+    /// Descarga un archivo remoto a disco (streaming, sin copia completa en RAM).
+    fn download_file(
+        &mut self,
+        remote: &str,
+        local: &Path,
+        on_progress: &mut ProgressFn,
+    ) -> Result<(), String>;
+    /// Sube un archivo local al remoto (streaming).
+    fn upload_file(
+        &mut self,
+        local: &Path,
+        remote: &str,
+        on_progress: &mut ProgressFn,
+    ) -> Result<(), String>;
+    fn mkdir(&mut self, remote: &str) -> Result<(), String>;
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), String>;
+    fn delete_file(&mut self, remote: &str) -> Result<(), String>;
+    /// Borra una carpeta (debe estar vacia; la recursion la hace lib.rs).
+    fn delete_dir(&mut self, remote: &str) -> Result<(), String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +182,84 @@ impl RemoteSource for FtpSource {
         // sin limite. Para un boton "Desconectar" preferimos cierre instantaneo.
         self.stream = None;
         Ok(())
+    }
+
+    fn download_file(
+        &mut self,
+        remote: &str,
+        local: &Path,
+        on_progress: &mut ProgressFn,
+    ) -> Result<(), String> {
+        let ftp = self.stream.as_mut().ok_or("No conectado")?;
+        let mut data = ftp
+            .retr_as_stream(remote)
+            .map_err(|e| format!("No se pudo abrir el archivo remoto: {e}"))?;
+        let mut file =
+            std::fs::File::create(local).map_err(|e| format!("No se pudo crear el archivo local: {e}"))?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = data.read(&mut buf).map_err(|e| format!("Error leyendo: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])
+                .map_err(|e| format!("Error escribiendo en disco: {e}"))?;
+            total += n as u64;
+            on_progress(total);
+        }
+        ftp.finalize_retr_stream(data)
+            .map_err(|e| format!("Error al finalizar la descarga: {e}"))?;
+        Ok(())
+    }
+
+    fn upload_file(
+        &mut self,
+        local: &Path,
+        remote: &str,
+        on_progress: &mut ProgressFn,
+    ) -> Result<(), String> {
+        let ftp = self.stream.as_mut().ok_or("No conectado")?;
+        let mut file =
+            std::fs::File::open(local).map_err(|e| format!("No se pudo abrir el archivo local: {e}"))?;
+        let mut data = ftp
+            .put_with_stream(remote)
+            .map_err(|e| format!("No se pudo crear el archivo remoto: {e}"))?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = file.read(&mut buf).map_err(|e| format!("Error leyendo local: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            data.write_all(&buf[..n])
+                .map_err(|e| format!("Error subiendo: {e}"))?;
+            total += n as u64;
+            on_progress(total);
+        }
+        ftp.finalize_put_stream(data)
+            .map_err(|e| format!("Error al finalizar la subida: {e}"))?;
+        Ok(())
+    }
+
+    fn mkdir(&mut self, remote: &str) -> Result<(), String> {
+        let ftp = self.stream.as_mut().ok_or("No conectado")?;
+        ftp.mkdir(remote).map_err(|e| e.to_string())
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), String> {
+        let ftp = self.stream.as_mut().ok_or("No conectado")?;
+        ftp.rename(from, to).map_err(|e| e.to_string())
+    }
+
+    fn delete_file(&mut self, remote: &str) -> Result<(), String> {
+        let ftp = self.stream.as_mut().ok_or("No conectado")?;
+        ftp.rm(remote).map_err(|e| e.to_string())
+    }
+
+    fn delete_dir(&mut self, remote: &str) -> Result<(), String> {
+        let ftp = self.stream.as_mut().ok_or("No conectado")?;
+        ftp.rmdir(remote).map_err(|e| e.to_string())
     }
 }
 
@@ -300,5 +405,108 @@ impl RemoteSource for SftpSource {
         self.sftp = None;
         self._session = None;
         Ok(())
+    }
+
+    fn download_file(
+        &mut self,
+        remote: &str,
+        local: &Path,
+        on_progress: &mut ProgressFn,
+    ) -> Result<(), String> {
+        let sftp = self.sftp.as_ref().ok_or("No conectado")?;
+        let remote = remote.to_string();
+        let local = local.to_path_buf();
+        self.rt.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut rfile = sftp
+                .open(&remote)
+                .await
+                .map_err(|e| format!("No se pudo abrir el archivo remoto: {e}"))?;
+            let mut lfile = tokio::fs::File::create(&local)
+                .await
+                .map_err(|e| format!("No se pudo crear el archivo local: {e}"))?;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut total: u64 = 0;
+            loop {
+                let n = rfile.read(&mut buf).await.map_err(|e| format!("Error leyendo: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                lfile
+                    .write_all(&buf[..n])
+                    .await
+                    .map_err(|e| format!("Error escribiendo en disco: {e}"))?;
+                total += n as u64;
+                on_progress(total);
+            }
+            lfile.flush().await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+    }
+
+    fn upload_file(
+        &mut self,
+        local: &Path,
+        remote: &str,
+        on_progress: &mut ProgressFn,
+    ) -> Result<(), String> {
+        let sftp = self.sftp.as_ref().ok_or("No conectado")?;
+        let remote = remote.to_string();
+        let local = local.to_path_buf();
+        self.rt.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut lfile = tokio::fs::File::open(&local)
+                .await
+                .map_err(|e| format!("No se pudo abrir el archivo local: {e}"))?;
+            let mut rfile = sftp
+                .create(&remote)
+                .await
+                .map_err(|e| format!("No se pudo crear el archivo remoto: {e}"))?;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut total: u64 = 0;
+            loop {
+                let n = lfile.read(&mut buf).await.map_err(|e| format!("Error leyendo local: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                rfile
+                    .write_all(&buf[..n])
+                    .await
+                    .map_err(|e| format!("Error subiendo: {e}"))?;
+                total += n as u64;
+                on_progress(total);
+            }
+            rfile.flush().await.map_err(|e| e.to_string())?;
+            rfile.shutdown().await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+    }
+
+    fn mkdir(&mut self, remote: &str) -> Result<(), String> {
+        let sftp = self.sftp.as_ref().ok_or("No conectado")?;
+        let p = remote.to_string();
+        self.rt
+            .block_on(async { sftp.create_dir(&p).await.map_err(|e| e.to_string()) })
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), String> {
+        let sftp = self.sftp.as_ref().ok_or("No conectado")?;
+        let (f, t) = (from.to_string(), to.to_string());
+        self.rt
+            .block_on(async { sftp.rename(&f, &t).await.map_err(|e| e.to_string()) })
+    }
+
+    fn delete_file(&mut self, remote: &str) -> Result<(), String> {
+        let sftp = self.sftp.as_ref().ok_or("No conectado")?;
+        let p = remote.to_string();
+        self.rt
+            .block_on(async { sftp.remove_file(&p).await.map_err(|e| e.to_string()) })
+    }
+
+    fn delete_dir(&mut self, remote: &str) -> Result<(), String> {
+        let sftp = self.sftp.as_ref().ok_or("No conectado")?;
+        let p = remote.to_string();
+        self.rt
+            .block_on(async { sftp.remove_dir(&p).await.map_err(|e| e.to_string()) })
     }
 }
