@@ -10,8 +10,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-/// Callback de progreso: recibe el total de bytes transferidos hasta ahora.
-pub type ProgressFn<'a> = dyn FnMut(u64) + 'a;
+/// Callback de progreso: recibe el total de bytes transferidos hasta ahora y
+/// devuelve `true` para continuar o `false` para CANCELAR la transferencia.
+pub type ProgressFn<'a> = dyn FnMut(u64) -> bool + 'a;
 
 fn default_true() -> bool {
     true
@@ -206,7 +207,9 @@ impl RemoteSource for FtpSource {
             file.write_all(&buf[..n])
                 .map_err(|e| format!("Error escribiendo en disco: {e}"))?;
             total += n as u64;
-            on_progress(total);
+            if !on_progress(total) {
+                return Err("Cancelado".to_string());
+            }
         }
         ftp.finalize_retr_stream(data)
             .map_err(|e| format!("Error al finalizar la descarga: {e}"))?;
@@ -235,7 +238,9 @@ impl RemoteSource for FtpSource {
             data.write_all(&buf[..n])
                 .map_err(|e| format!("Error subiendo: {e}"))?;
             total += n as u64;
-            on_progress(total);
+            if !on_progress(total) {
+                return Err("Cancelado".to_string());
+            }
         }
         ftp.finalize_put_stream(data)
             .map_err(|e| format!("Error al finalizar la subida: {e}"))?;
@@ -437,7 +442,9 @@ impl RemoteSource for SftpSource {
                     .await
                     .map_err(|e| format!("Error escribiendo en disco: {e}"))?;
                 total += n as u64;
-                on_progress(total);
+                if !on_progress(total) {
+                    return Err("Cancelado".to_string());
+                }
             }
             lfile.flush().await.map_err(|e| e.to_string())?;
             Ok::<_, String>(())
@@ -474,7 +481,9 @@ impl RemoteSource for SftpSource {
                     .await
                     .map_err(|e| format!("Error subiendo: {e}"))?;
                 total += n as u64;
-                on_progress(total);
+                if !on_progress(total) {
+                    return Err("Cancelado".to_string());
+                }
             }
             rfile.flush().await.map_err(|e| e.to_string())?;
             rfile.shutdown().await.map_err(|e| e.to_string())?;

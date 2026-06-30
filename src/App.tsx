@@ -28,7 +28,11 @@ type Xfer = {
   name: string;
   transferred: number;
   total: number;
-  speed: number; // bytes/s
+  overall: number;
+  overallTotal: number;
+  filesDone: number;
+  totalFiles: number;
+  speed: number; // bytes/s (general)
 };
 
 // ---- Formateadores ----
@@ -170,31 +174,42 @@ export default function App() {
   useEffect(() => {
     const un = listen<{
       kind: "download" | "upload";
-      state: "progress" | "done" | "error";
+      state: "progress" | "done" | "error" | "cancelled";
       name: string;
       transferred: number;
       total: number;
+      overallTransferred: number;
+      overallTotal: number;
+      filesDone: number;
+      totalFiles: number;
     }>("transfer", (e) => {
       const p = e.payload;
-      if (p.state === "done") {
+      if (p.state !== "progress") {
+        // done | cancelled | error -> cerrar barra y refrescar destino
         setXfer(null);
         if (p.kind === "download") loadLocal(localDir?.path ?? null);
         else openRemote(remotePath);
         return;
       }
-      if (p.state === "error") {
-        setXfer(null);
-        return;
-      }
-      // progress: calcular velocidad
+      // velocidad general (a partir de los bytes totales)
       const now = performance.now();
       const prev = xferRef.current;
       let speed = 0;
       if (prev.t && now > prev.t) {
-        speed = ((p.transferred - prev.bytes) * 1000) / (now - prev.t);
+        speed = ((p.overallTransferred - prev.bytes) * 1000) / (now - prev.t);
       }
-      xferRef.current = { t: now, bytes: p.transferred };
-      setXfer({ kind: p.kind, name: p.name, transferred: p.transferred, total: p.total, speed });
+      xferRef.current = { t: now, bytes: p.overallTransferred };
+      setXfer({
+        kind: p.kind,
+        name: p.name,
+        transferred: p.transferred,
+        total: p.total,
+        overall: p.overallTransferred,
+        overallTotal: p.overallTotal,
+        filesDone: p.filesDone,
+        totalFiles: p.totalFiles,
+        speed,
+      });
     });
     return () => {
       un.then((f) => f());
@@ -414,8 +429,10 @@ export default function App() {
     if (side === "remote" && d.side === "local") uploadItems(d.items);
   }
 
-  const pct = xfer && xfer.total > 0 ? Math.min(100, (xfer.transferred / xfer.total) * 100) : 0;
-  const eta = xfer && xfer.speed > 0 ? (xfer.total - xfer.transferred) / xfer.speed : 0;
+  const filePct = xfer && xfer.total > 0 ? Math.min(100, (xfer.transferred / xfer.total) * 100) : 0;
+  const overallPct =
+    xfer && xfer.overallTotal > 0 ? Math.min(100, (xfer.overall / xfer.overallTotal) * 100) : 0;
+  const eta = xfer && xfer.speed > 0 ? (xfer.overallTotal - xfer.overall) / xfer.speed : 0;
 
   return (
     <div className="flex h-full flex-col bg-slate-900 text-slate-200">
@@ -572,20 +589,46 @@ export default function App() {
         </Pane>
       </div>
 
-      {/* Barra de transferencia */}
+      {/* Barra de transferencia: archivo actual + avance general + cancelar */}
       {xfer && (
-        <div className="border-t border-slate-700 bg-slate-800 px-4 py-1.5">
-          <div className="mb-1 flex items-center justify-between text-xs">
-            <span className="truncate text-slate-200">
-              {xfer.kind === "download" ? "⬇" : "⬆"} {xfer.name}
-            </span>
-            <span className="shrink-0 text-slate-400">
-              {pct.toFixed(0)}% · {fmtSpeed(xfer.speed)}
-              {eta ? ` · ETA ${fmtEta(eta)}` : ""}
-            </span>
-          </div>
-          <div className="h-1.5 w-full overflow-hidden rounded bg-slate-700">
-            <div className="h-full bg-sky-500 transition-all" style={{ width: `${pct}%` }} />
+        <div className="border-t border-slate-700 bg-slate-800 px-4 py-2">
+          <div className="flex items-center gap-4">
+            <div className="min-w-0 flex-1">
+              {/* Archivo actual */}
+              <div className="mb-1 flex items-center justify-between text-xs">
+                <span className="truncate text-slate-200">
+                  {xfer.kind === "download" ? "⬇" : "⬆"} {xfer.name}
+                </span>
+                <span className="shrink-0 text-slate-400">{filePct.toFixed(0)}%</span>
+              </div>
+              <div className="h-1.5 w-full overflow-hidden rounded bg-slate-700">
+                <div className="h-full bg-sky-400 transition-all" style={{ width: `${filePct}%` }} />
+              </div>
+              {/* Avance general */}
+              <div className="mt-2 mb-1 flex items-center justify-between text-xs">
+                <span className="truncate text-slate-400">
+                  General · archivo {Math.min(xfer.filesDone + 1, xfer.totalFiles)} de{" "}
+                  {xfer.totalFiles} · {fmtSize(xfer.overall)} / {fmtSize(xfer.overallTotal)}
+                </span>
+                <span className="shrink-0 text-slate-400">
+                  {overallPct.toFixed(0)}% · {fmtSpeed(xfer.speed)}
+                  {eta ? ` · ETA ${fmtEta(eta)}` : ""}
+                </span>
+              </div>
+              <div className="h-2 w-full overflow-hidden rounded bg-slate-700">
+                <div
+                  className="h-full bg-sky-500 transition-all"
+                  style={{ width: `${overallPct}%` }}
+                />
+              </div>
+            </div>
+            <button
+              className="btn btn-secondary flex shrink-0 items-center gap-1.5"
+              onClick={() => invoke("cancel_transfer")}
+              title="Cancelar transferencia"
+            >
+              <Icon name="x" className="h-4 w-4" /> Cancelar
+            </button>
           </div>
         </div>
       )}
@@ -758,6 +801,12 @@ function Icon({ name, className = "h-4 w-4" }: { name: string; className?: strin
         <svg {...p}>
           <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
           <path d="M14 2v6h6" />
+        </svg>
+      );
+    case "x":
+      return (
+        <svg {...p}>
+          <path d="M18 6L6 18M6 6l12 12" />
         </svg>
       );
     case "github":

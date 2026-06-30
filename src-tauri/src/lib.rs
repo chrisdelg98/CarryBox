@@ -3,6 +3,7 @@ mod remote;
 use remote::{ConnConfig, FtpSource, RemoteEntry, RemoteSource, SftpSource};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -13,6 +14,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 #[derive(Default)]
 struct AppState {
     source: Arc<Mutex<Option<Box<dyn RemoteSource>>>>,
+    /// Bandera para cancelar la transferencia en curso.
+    cancel: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -93,15 +96,21 @@ struct TransferItem {
 
 /// Progreso de transferencia que viaja al frontend por el evento "transfer".
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TransferProgress {
     /// "download" | "upload"
     kind: String,
-    /// "progress" | "done" | "error"
+    /// "progress" | "done" | "error" | "cancelled"
     state: String,
     /// Archivo actual.
     name: String,
     transferred: u64,
     total: u64,
+    // --- Avance general de TODO el lote ---
+    overall_transferred: u64,
+    overall_total: u64,
+    files_done: u64,
+    total_files: u64,
 }
 
 fn join_remote(base: &str, name: &str) -> String {
@@ -112,17 +121,39 @@ fn join_remote(base: &str, name: &str) -> String {
     }
 }
 
-fn emit_progress(app: &AppHandle, kind: &str, state: &str, name: &str, transferred: u64, total: u64) {
-    let _ = app.emit(
-        "transfer",
-        TransferProgress {
-            kind: kind.into(),
-            state: state.into(),
-            name: name.into(),
-            transferred,
-            total,
-        },
-    );
+/// Contexto de una transferencia en curso (lote): lleva los totales generales,
+/// la bandera de cancelacion y emite el progreso a la UI con throttle.
+struct Xfer {
+    app: AppHandle,
+    kind: &'static str,
+    cancel: Arc<AtomicBool>,
+    total_files: u64,
+    total_bytes: u64,
+    files_done: u64,
+    bytes_done: u64, // bytes de archivos ya completados
+    last_emit: Instant,
+}
+
+impl Xfer {
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+    fn emit(&self, state: &str, name: &str, cur: u64, cur_total: u64) {
+        let _ = self.app.emit(
+            "transfer",
+            TransferProgress {
+                kind: self.kind.into(),
+                state: state.into(),
+                name: name.into(),
+                transferred: cur,
+                total: cur_total,
+                overall_transferred: self.bytes_done + cur,
+                overall_total: self.total_bytes,
+                files_done: self.files_done,
+                total_files: self.total_files,
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,47 +250,102 @@ async fn remote_disconnect(app: AppHandle, state: State<'_, AppState>) -> Result
 
 // --- Recursion (bajar/subir/borrar carpetas enteras) usando el trait ---
 
+/// Cuenta archivos y bytes de un arbol remoto (para el avance general).
+fn count_remote(
+    src: &mut Box<dyn RemoteSource>,
+    path: &str,
+    is_dir: bool,
+    size: u64,
+) -> Result<(u64, u64), String> {
+    if is_dir {
+        let (mut f, mut b) = (0u64, 0u64);
+        for e in src.list_dir(path)? {
+            let (cf, cb) = count_remote(src, &join_remote(path, &e.name), e.is_dir, e.size)?;
+            f += cf;
+            b += cb;
+        }
+        Ok((f, b))
+    } else {
+        Ok((1, size))
+    }
+}
+
+/// Cuenta archivos y bytes de un arbol local.
+fn count_local(path: &Path, is_dir: bool, size: u64) -> (u64, u64) {
+    if is_dir {
+        let (mut f, mut b) = (0u64, 0u64);
+        if let Ok(rd) = std::fs::read_dir(path) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                let isd = p.is_dir();
+                let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let (cf, cb) = count_local(&p, isd, sz);
+                f += cf;
+                b += cb;
+            }
+        }
+        (f, b)
+    } else {
+        (1, size)
+    }
+}
+
 fn do_download(
     src: &mut Box<dyn RemoteSource>,
-    app: &AppHandle,
+    ctx: &mut Xfer,
     remote_path: &str,
     name: &str,
     is_dir: bool,
     size: u64,
     local_parent: &Path,
 ) -> Result<(), String> {
+    if ctx.cancelled() {
+        return Err("Cancelado".to_string());
+    }
     let local_target = local_parent.join(name);
     if is_dir {
         std::fs::create_dir_all(&local_target).map_err(|e| e.to_string())?;
         for e in src.list_dir(remote_path)? {
             let child = join_remote(remote_path, &e.name);
-            do_download(src, app, &child, &e.name, e.is_dir, e.size, &local_target)?;
+            do_download(src, ctx, &child, &e.name, e.is_dir, e.size, &local_target)?;
         }
     } else {
-        emit_progress(app, "download", "progress", name, 0, size);
-        let appc = app.clone();
-        let namec = name.to_string();
-        let mut last = Instant::now();
-        let mut cb = move |t: u64| {
-            if last.elapsed() >= Duration::from_millis(80) {
-                last = Instant::now();
-                emit_progress(&appc, "download", "progress", &namec, t, size);
-            }
+        ctx.emit("progress", name, 0, size);
+        let res = {
+            let mut cb = |t: u64| -> bool {
+                if ctx.cancelled() {
+                    return false;
+                }
+                if ctx.last_emit.elapsed() >= Duration::from_millis(80) {
+                    ctx.last_emit = Instant::now();
+                    ctx.emit("progress", name, t, size);
+                }
+                true
+            };
+            src.download_file(remote_path, &local_target, &mut cb)
         };
-        src.download_file(remote_path, &local_target, &mut cb)?;
-        emit_progress(app, "download", "progress", name, size, size);
+        if let Err(e) = res {
+            let _ = std::fs::remove_file(&local_target); // limpiar parcial
+            return Err(e);
+        }
+        ctx.bytes_done += size;
+        ctx.files_done += 1;
+        ctx.emit("progress", name, size, size);
     }
     Ok(())
 }
 
 fn do_upload(
     src: &mut Box<dyn RemoteSource>,
-    app: &AppHandle,
+    ctx: &mut Xfer,
     local_path: &Path,
     name: &str,
     is_dir: bool,
     remote_parent: &str,
 ) -> Result<(), String> {
+    if ctx.cancelled() {
+        return Err("Cancelado".to_string());
+    }
     let remote_target = join_remote(remote_parent, name);
     if is_dir {
         let _ = src.mkdir(&remote_target); // si ya existe, seguimos
@@ -268,22 +354,28 @@ fn do_upload(
             let p = entry.path();
             let n = entry.file_name().to_string_lossy().to_string();
             let isd = p.is_dir();
-            do_upload(src, app, &p, &n, isd, &remote_target)?;
+            do_upload(src, ctx, &p, &n, isd, &remote_target)?;
         }
     } else {
         let size = std::fs::metadata(local_path).map(|m| m.len()).unwrap_or(0);
-        emit_progress(app, "upload", "progress", name, 0, size);
-        let appc = app.clone();
-        let namec = name.to_string();
-        let mut last = Instant::now();
-        let mut cb = move |t: u64| {
-            if last.elapsed() >= Duration::from_millis(80) {
-                last = Instant::now();
-                emit_progress(&appc, "upload", "progress", &namec, t, size);
-            }
+        ctx.emit("progress", name, 0, size);
+        let res = {
+            let mut cb = |t: u64| -> bool {
+                if ctx.cancelled() {
+                    return false;
+                }
+                if ctx.last_emit.elapsed() >= Duration::from_millis(80) {
+                    ctx.last_emit = Instant::now();
+                    ctx.emit("progress", name, t, size);
+                }
+                true
+            };
+            src.upload_file(local_path, &remote_target, &mut cb)
         };
-        src.upload_file(local_path, &remote_target, &mut cb)?;
-        emit_progress(app, "upload", "progress", name, size, size);
+        res?;
+        ctx.bytes_done += size;
+        ctx.files_done += 1;
+        ctx.emit("progress", name, size, size);
     }
     Ok(())
 }
@@ -308,20 +400,44 @@ async fn remote_download(
     local_dir: String,
 ) -> Result<(), String> {
     let arc = state.source.clone();
+    let cancel = state.cancel.clone();
+    cancel.store(false, Ordering::Relaxed);
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let mut guard = arc.lock().map_err(|_| "estado bloqueado".to_string())?;
         let src = guard.as_mut().ok_or("No conectado")?;
+        emit(&app, "status", "Calculando total...");
+        let (mut tf, mut tb) = (0u64, 0u64);
+        for it in &items {
+            let (f, b) = count_remote(src, &it.path, it.is_dir, it.size)?;
+            tf += f;
+            tb += b;
+        }
+        let mut ctx = Xfer {
+            app: app.clone(),
+            kind: "download",
+            cancel: cancel.clone(),
+            total_files: tf,
+            total_bytes: tb,
+            files_done: 0,
+            bytes_done: 0,
+            last_emit: Instant::now(),
+        };
         let base = PathBuf::from(&local_dir);
         for it in &items {
             emit(&app, "status", format!("Descargando: {}", it.name));
-            if let Err(e) = do_download(src, &app, &it.path, &it.name, it.is_dir, it.size, &base) {
+            if let Err(e) = do_download(src, &mut ctx, &it.path, &it.name, it.is_dir, it.size, &base) {
+                if cancel.load(Ordering::Relaxed) {
+                    emit(&app, "status", "Transferencia cancelada.");
+                    ctx.emit("cancelled", "", 0, 0);
+                    return Ok(());
+                }
                 emit(&app, "error", e.clone());
-                emit_progress(&app, "download", "error", &it.name, 0, 0);
+                ctx.emit("error", &it.name, 0, 0);
                 return Err(e);
             }
         }
         emit(&app, "status", "Descarga completada.");
-        emit_progress(&app, "download", "done", "", 0, 0);
+        ctx.emit("done", "", 0, 0);
         Ok(())
     })
     .await
@@ -336,20 +452,44 @@ async fn remote_upload(
     remote_dir: String,
 ) -> Result<(), String> {
     let arc = state.source.clone();
+    let cancel = state.cancel.clone();
+    cancel.store(false, Ordering::Relaxed);
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let mut guard = arc.lock().map_err(|_| "estado bloqueado".to_string())?;
         let src = guard.as_mut().ok_or("No conectado")?;
+        let (mut tf, mut tb) = (0u64, 0u64);
+        for it in &items {
+            let lp = PathBuf::from(&it.path);
+            let (f, b) = count_local(&lp, it.is_dir, it.size);
+            tf += f;
+            tb += b;
+        }
+        let mut ctx = Xfer {
+            app: app.clone(),
+            kind: "upload",
+            cancel: cancel.clone(),
+            total_files: tf,
+            total_bytes: tb,
+            files_done: 0,
+            bytes_done: 0,
+            last_emit: Instant::now(),
+        };
         for it in &items {
             emit(&app, "status", format!("Subiendo: {}", it.name));
             let lp = PathBuf::from(&it.path);
-            if let Err(e) = do_upload(src, &app, &lp, &it.name, it.is_dir, &remote_dir) {
+            if let Err(e) = do_upload(src, &mut ctx, &lp, &it.name, it.is_dir, &remote_dir) {
+                if cancel.load(Ordering::Relaxed) {
+                    emit(&app, "status", "Transferencia cancelada.");
+                    ctx.emit("cancelled", "", 0, 0);
+                    return Ok(());
+                }
                 emit(&app, "error", e.clone());
-                emit_progress(&app, "upload", "error", &it.name, 0, 0);
+                ctx.emit("error", &it.name, 0, 0);
                 return Err(e);
             }
         }
         emit(&app, "status", "Subida completada.");
-        emit_progress(&app, "upload", "done", "", 0, 0);
+        ctx.emit("done", "", 0, 0);
         Ok(())
     })
     .await
@@ -413,6 +553,12 @@ async fn remote_delete(
     })
     .await
     .map_err(|e| format!("tarea fallo: {e}"))?
+}
+
+/// Cancelar la transferencia en curso (la bandera la leen los bucles de copia).
+#[tauri::command]
+fn cancel_transfer(state: State<'_, AppState>) {
+    state.cancel.store(true, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +688,7 @@ pub fn run() {
             remote_mkdir,
             remote_rename,
             remote_delete,
+            cancel_transfer,
             list_local,
             local_mkdir,
             local_rename,
