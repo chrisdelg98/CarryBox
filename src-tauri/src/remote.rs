@@ -7,8 +7,77 @@
 
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::path::Path;
-use std::time::UNIX_EPOCH;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, UNIX_EPOCH};
+
+/// Tiempo maximo sin recibir/enviar datos antes de considerar la conexion colgada.
+const IO_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Permite CANCELAR al instante una transferencia colgada: guarda un clon del
+/// socket de datos en curso; `shutdown()` lo cierra y desbloquea el `read()`.
+#[derive(Default)]
+struct CancelSockets {
+    control: Option<TcpStream>,
+    data: Option<TcpStream>,
+}
+
+#[derive(Clone, Default)]
+pub struct CancelHandle(Arc<Mutex<CancelSockets>>);
+
+impl CancelHandle {
+    /// Cierra sockets de control y datos (si existen), abortando reads/writes bloqueados.
+    pub fn shutdown(&self) {
+        if let Ok(g) = self.0.lock() {
+            if let Some(s) = g.data.as_ref() {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+            if let Some(s) = g.control.as_ref() {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    /// Registra (o limpia) el socket de control de la sesion FTP.
+    fn set_control(&self, socket: Option<TcpStream>) {
+        if let Ok(mut g) = self.0.lock() {
+            g.control = socket;
+        }
+    }
+
+    /// Registra (o limpia) el socket de datos de la transferencia actual.
+    fn set_data(&self, socket: Option<TcpStream>) {
+        if let Ok(mut g) = self.0.lock() {
+            g.data = socket;
+        }
+    }
+
+    /// Limpia ambos sockets registrados.
+    fn clear_all(&self) {
+        if let Ok(mut g) = self.0.lock() {
+            g.control = None;
+            g.data = None;
+        }
+    }
+}
+
+/// Limpia el socket registrado al salir de una transferencia, incluso si falla.
+struct CancelSlotGuard {
+    cancel: CancelHandle,
+}
+
+impl CancelSlotGuard {
+    fn new(cancel: CancelHandle) -> Self {
+        Self { cancel }
+    }
+}
+
+impl Drop for CancelSlotGuard {
+    fn drop(&mut self) {
+        self.cancel.set_data(None);
+    }
+}
 
 /// Callback de progreso: recibe el total de bytes transferidos hasta ahora y
 /// devuelve `true` para continuar o `false` para CANCELAR la transferencia.
@@ -53,17 +122,20 @@ pub trait RemoteSource: Send {
     fn disconnect(&mut self) -> Result<(), String>;
 
     /// Descarga un archivo remoto a disco (streaming, sin copia completa en RAM).
+    /// `resume_from` = bytes ya presentes en disco para REANUDAR (0 = desde cero).
     fn download_file(
         &mut self,
         remote: &str,
         local: &Path,
+        resume_from: u64,
         on_progress: &mut ProgressFn,
     ) -> Result<(), String>;
-    /// Sube un archivo local al remoto (streaming).
+    /// Sube un archivo local al remoto (streaming). `resume_from` reservado.
     fn upload_file(
         &mut self,
         local: &Path,
         remote: &str,
+        resume_from: u64,
         on_progress: &mut ProgressFn,
     ) -> Result<(), String>;
     fn mkdir(&mut self, remote: &str) -> Result<(), String>;
@@ -89,11 +161,15 @@ type Ftp = NativeTlsFtpStream;
 #[derive(Default)]
 pub struct FtpSource {
     stream: Option<Ftp>,
+    cancel: CancelHandle,
 }
 
 impl FtpSource {
-    pub fn new() -> Self {
-        Self { stream: None }
+    pub fn new(cancel: CancelHandle) -> Self {
+        Self {
+            stream: None,
+            cancel,
+        }
     }
 }
 
@@ -130,6 +206,11 @@ impl RemoteSource for FtpSource {
         } else {
             ftp.set_mode(Mode::Active);
         }
+        // Timeout en el control: si el server deja de responder, da error (recuperable)
+        // en vez de colgarse para siempre.
+        let _ = ftp.get_ref().set_read_timeout(Some(IO_TIMEOUT));
+        let _ = ftp.get_ref().set_write_timeout(Some(IO_TIMEOUT));
+        self.cancel.set_control(ftp.get_ref().try_clone().ok());
         self.stream = Some(ftp);
         Ok(())
     }
@@ -182,6 +263,7 @@ impl RemoteSource for FtpSource {
         // control esta medio muerto (p.ej. tras un timeout de datos) se cuelga
         // sin limite. Para un boton "Desconectar" preferimos cierre instantaneo.
         self.stream = None;
+        self.cancel.clear_all();
         Ok(())
     }
 
@@ -189,16 +271,35 @@ impl RemoteSource for FtpSource {
         &mut self,
         remote: &str,
         local: &Path,
+        resume_from: u64,
         on_progress: &mut ProgressFn,
     ) -> Result<(), String> {
+        let cancel = self.cancel.clone();
+        let _slot_guard = CancelSlotGuard::new(cancel.clone());
         let ftp = self.stream.as_mut().ok_or("No conectado")?;
+        if resume_from > 0 {
+            // REST: pedir al server que continue desde el offset.
+            ftp.resume_transfer(resume_from as usize)
+                .map_err(|e| format!("No se pudo reanudar: {e}"))?;
+        }
         let mut data = ftp
             .retr_as_stream(remote)
             .map_err(|e| format!("No se pudo abrir el archivo remoto: {e}"))?;
-        let mut file =
-            std::fs::File::create(local).map_err(|e| format!("No se pudo crear el archivo local: {e}"))?;
+        // Timeout en el canal de datos: evita que un read se cuelgue para siempre.
+        let _ = data.get_ref().set_read_timeout(Some(IO_TIMEOUT));
+        // Registrar el socket para poder CANCELAR al instante (cerrarlo).
+        cancel.set_data(data.get_ref().try_clone().ok());
+        let mut file = if resume_from > 0 {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(local)
+                .map_err(|e| format!("No se pudo abrir el archivo local: {e}"))?
+        } else {
+            std::fs::File::create(local)
+                .map_err(|e| format!("No se pudo crear el archivo local: {e}"))?
+        };
         let mut buf = vec![0u8; 64 * 1024];
-        let mut total: u64 = 0;
+        let mut total: u64 = resume_from;
         loop {
             let n = data.read(&mut buf).map_err(|e| format!("Error leyendo: {e}"))?;
             if n == 0 {
@@ -220,14 +321,20 @@ impl RemoteSource for FtpSource {
         &mut self,
         local: &Path,
         remote: &str,
+        resume_from: u64,
         on_progress: &mut ProgressFn,
     ) -> Result<(), String> {
+        let _ = resume_from; // reanudacion de subida: pendiente
+        let cancel = self.cancel.clone();
+        let _slot_guard = CancelSlotGuard::new(cancel.clone());
         let ftp = self.stream.as_mut().ok_or("No conectado")?;
         let mut file =
             std::fs::File::open(local).map_err(|e| format!("No se pudo abrir el archivo local: {e}"))?;
         let mut data = ftp
             .put_with_stream(remote)
             .map_err(|e| format!("No se pudo crear el archivo remoto: {e}"))?;
+        let _ = data.get_ref().set_write_timeout(Some(IO_TIMEOUT));
+        cancel.set_data(data.get_ref().try_clone().ok());
         let mut buf = vec![0u8; 64 * 1024];
         let mut total: u64 = 0;
         loop {
@@ -416,24 +523,40 @@ impl RemoteSource for SftpSource {
         &mut self,
         remote: &str,
         local: &Path,
+        resume_from: u64,
         on_progress: &mut ProgressFn,
     ) -> Result<(), String> {
         let sftp = self.sftp.as_ref().ok_or("No conectado")?;
         let remote = remote.to_string();
         let local = local.to_path_buf();
         self.rt.block_on(async {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
             let mut rfile = sftp
                 .open(&remote)
                 .await
                 .map_err(|e| format!("No se pudo abrir el archivo remoto: {e}"))?;
-            let mut lfile = tokio::fs::File::create(&local)
-                .await
-                .map_err(|e| format!("No se pudo crear el archivo local: {e}"))?;
+            let mut lfile = if resume_from > 0 {
+                rfile
+                    .seek(std::io::SeekFrom::Start(resume_from))
+                    .await
+                    .map_err(|e| format!("No se pudo reanudar (seek): {e}"))?;
+                tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&local)
+                    .await
+                    .map_err(|e| format!("No se pudo abrir el archivo local: {e}"))?
+            } else {
+                tokio::fs::File::create(&local)
+                    .await
+                    .map_err(|e| format!("No se pudo crear el archivo local: {e}"))?
+            };
             let mut buf = vec![0u8; 64 * 1024];
-            let mut total: u64 = 0;
+            let mut total: u64 = resume_from;
             loop {
-                let n = rfile.read(&mut buf).await.map_err(|e| format!("Error leyendo: {e}"))?;
+                let n = match tokio::time::timeout(IO_TIMEOUT, rfile.read(&mut buf)).await {
+                    Ok(r) => r.map_err(|e| format!("Error leyendo: {e}"))?,
+                    Err(_) => return Err("Lectura agotada (timed out)".to_string()),
+                };
                 if n == 0 {
                     break;
                 }
@@ -455,8 +578,10 @@ impl RemoteSource for SftpSource {
         &mut self,
         local: &Path,
         remote: &str,
+        resume_from: u64,
         on_progress: &mut ProgressFn,
     ) -> Result<(), String> {
+        let _ = resume_from; // reanudacion de subida: pendiente
         let sftp = self.sftp.as_ref().ok_or("No conectado")?;
         let remote = remote.to_string();
         let local = local.to_path_buf();

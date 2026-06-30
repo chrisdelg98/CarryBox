@@ -22,6 +22,7 @@ type ItemRow = {
 
 type LogKind = "status" | "command" | "response" | "error";
 type LogItem = { kind: LogKind; text: string; time: string };
+type ConflictPolicy = "replace" | "skip" | "newer" | "keep_both";
 
 type Xfer = {
   kind: "download" | "upload";
@@ -131,7 +132,15 @@ export default function App() {
     null,
   );
   // --- Modal (prompt / confirm) ---
-  type Modal = { type: "prompt" | "confirm"; title: string; value: string };
+  type Modal =
+    | { type: "prompt"; title: string; value: string }
+    | { type: "confirm"; title: string; value: string }
+    | {
+        type: "choice";
+        title: string;
+        value: string;
+        options: { label: string; value: string }[];
+      };
   const [modal, setModal] = useState<Modal | null>(null);
   const modalResolve = useRef<((v: string | boolean | null) => void) | null>(null);
   function askText(title: string, def = ""): Promise<string | null> {
@@ -144,6 +153,15 @@ export default function App() {
     return new Promise((res) => {
       modalResolve.current = res as (v: string | boolean | null) => void;
       setModal({ type: "confirm", title, value: "" });
+    });
+  }
+  function askChoice(
+    title: string,
+    options: { label: string; value: string }[],
+  ): Promise<string | null> {
+    return new Promise((res) => {
+      modalResolve.current = res as (v: string | boolean | null) => void;
+      setModal({ type: "choice", title, value: "", options });
     });
   }
   function closeModal(result: string | boolean | null) {
@@ -327,10 +345,31 @@ export default function App() {
       addLog("error", "Conéctate primero para subir.");
       return;
     }
+    let conflictPolicy: ConflictPolicy = "replace";
+    const remoteNames = new Set(remoteRows.map((r) => r.name.toLowerCase()));
+    const hasTopLevelConflict = rows.some((r) => remoteNames.has(r.name.toLowerCase()));
+    if (hasTopLevelConflict) {
+      const chosen = await askChoice(
+        "Ya existen elementos con el mismo nombre en el destino. ¿Qué deseas hacer?",
+        [
+          { label: "Reemplazar existentes", value: "replace" },
+          { label: "Solo nuevos (omitir existentes)", value: "skip" },
+          { label: "Solo si local es más nuevo", value: "newer" },
+          { label: "Conservar ambos (renombrar copia)", value: "keep_both" },
+        ],
+      );
+      if (!chosen) {
+        addLog("status", "Subida cancelada por el usuario.");
+        return;
+      }
+      conflictPolicy = chosen as ConflictPolicy;
+    }
     xferRef.current = { t: 0, bytes: 0 };
-    await invoke("remote_upload", { items: toItems(rows), remoteDir: remotePath }).catch((e) =>
-      addLog("error", `${e}`),
-    );
+    await invoke("remote_upload", {
+      items: toItems(rows),
+      remoteDir: remotePath,
+      conflictPolicy,
+    }).catch((e) => addLog("error", `${e}`));
   }
 
   // ---- Acciones de gestión ----
@@ -712,20 +751,37 @@ export default function App() {
                 onKeyDown={(e) => e.key === "Enter" && closeModal(modal.value)}
               />
             )}
-            <div className="flex justify-end gap-2">
-              <button
-                className="btn btn-secondary"
-                onClick={() => closeModal(modal.type === "confirm" ? false : null)}
-              >
-                Cancelar
-              </button>
-              <button
-                className="btn btn-primary"
-                onClick={() => closeModal(modal.type === "confirm" ? true : modal.value)}
-              >
-                Aceptar
-              </button>
-            </div>
+            {modal.type === "choice" ? (
+              <div className="flex flex-col gap-2">
+                {modal.options.map((opt) => (
+                  <button
+                    key={opt.value}
+                    className="btn btn-secondary w-full text-left"
+                    onClick={() => closeModal(opt.value)}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+                <button className="btn btn-primary w-full" onClick={() => closeModal(null)}>
+                  Cancelar
+                </button>
+              </div>
+            ) : (
+              <div className="flex justify-end gap-2">
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => closeModal(modal.type === "confirm" ? false : null)}
+                >
+                  Cancelar
+                </button>
+                <button
+                  className="btn btn-primary"
+                  onClick={() => closeModal(modal.type === "confirm" ? true : modal.value)}
+                >
+                  Aceptar
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}
