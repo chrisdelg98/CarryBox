@@ -163,19 +163,19 @@ export default function App() {
       <header className="border-b border-slate-700 bg-slate-800 px-4 py-2">
         <div className="mb-2 flex items-center gap-2">
           <span className="text-lg font-semibold text-sky-400">CarryBox</span>
-          <span className="text-xs text-slate-400">· Descargar · FTP / FTPS (estilo FileZilla)</span>
+          <span className="text-xs text-slate-400">· Descargar · SFTP · FTP · FTPS</span>
         </div>
         <div className="flex flex-wrap items-end gap-2">
           <Field label="Protocolo">
             <select
-              className="input w-40"
+              className="select w-56"
               value={protocol}
               onChange={(e) => changeProtocol(e.target.value as Protocol)}
               disabled={connected}
             >
               <option value="sftp">SFTP (SSH) · recomendado</option>
               <option value="ftp">FTP</option>
-              <option value="ftps">FTPS (FTP cifrado)</option>
+              <option value="ftps">FTPS (cifrado)</option>
             </select>
           </Field>
           <Field label="Servidor (host)">
@@ -223,7 +223,7 @@ export default function App() {
             </button>
           )}
           <button
-            className="btn-mini self-end pb-1.5"
+            className="btn btn-secondary"
             onClick={() => setShowAdvanced((v) => !v)}
             title="Opciones avanzadas"
           >
@@ -295,7 +295,7 @@ export default function App() {
               }))}
             />
           ) : (
-            <div className="flex h-full items-center justify-center px-4 text-center text-sm text-slate-500">
+            <div className="flex flex-1 items-center justify-center px-4 text-center text-sm text-slate-500">
               No conectado. Llena los datos y pulsa “Conectar”.
             </div>
           )}
@@ -385,41 +385,65 @@ type Row = {
   onOpen: () => void;
 };
 
+function summarize(rows: Row[]): string {
+  const dirs = rows.filter((r) => r.is_dir).length;
+  const files = rows.length - dirs;
+  return `${dirs} ${dirs === 1 ? "carpeta" : "carpetas"} · ${files} ${
+    files === 1 ? "archivo" : "archivos"
+  }`;
+}
+
 function FileTable({ rows }: { rows: Row[] }) {
+  const [selected, setSelected] = useState<string | null>(null);
   return (
-    <div className="min-h-0 flex-1 overflow-auto">
-      <table className="w-full text-sm">
-        <thead className="sticky top-0 bg-slate-800 text-left text-xs text-slate-400">
-          <tr>
-            <th className="px-3 py-1 font-medium">Nombre</th>
-            <th className="px-3 py-1 font-medium">Tamano</th>
-            <th className="px-3 py-1 font-medium">Modificado</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr
-              key={r.key}
-              onDoubleClick={r.onOpen}
-              className="cursor-default border-b border-slate-800 hover:bg-slate-800/70"
-            >
-              <td className="px-3 py-1">
-                <span className="mr-1.5">{r.is_dir ? "📁" : "📄"}</span>
-                {r.name}
-              </td>
-              <td className="px-3 py-1 text-slate-400">{r.is_dir ? "" : fmtSize(r.size)}</td>
-              <td className="px-3 py-1 text-slate-400">{fmtDate(r.modified)}</td>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="min-h-0 flex-1 overflow-auto">
+        <table className="w-full border-collapse text-sm">
+          <thead className="sticky top-0 z-10 bg-slate-800 text-left text-xs text-slate-400">
+            <tr className="border-b border-slate-700">
+              <th className="px-3 py-1.5 font-medium">Nombre</th>
+              <th className="px-3 py-1.5 text-right font-medium">Tamaño</th>
+              <th className="px-3 py-1.5 font-medium">Modificado</th>
             </tr>
-          ))}
-          {rows.length === 0 && (
-            <tr>
-              <td colSpan={3} className="px-3 py-3 text-xs text-slate-600">
-                (carpeta vacia)
-              </td>
-            </tr>
-          )}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {rows.map((r) => {
+              const isSel = selected === r.key;
+              return (
+                <tr
+                  key={r.key}
+                  onClick={() => setSelected(r.key)}
+                  onDoubleClick={r.onOpen}
+                  className={`cursor-default select-none ${
+                    isSel ? "bg-sky-600/30" : "hover:bg-slate-800/60"
+                  }`}
+                >
+                  <td className="max-w-0 truncate px-3 py-1.5" title={r.name}>
+                    <span className="mr-2">{r.is_dir ? "📁" : "📄"}</span>
+                    {r.name}
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-1.5 text-right text-slate-400">
+                    {r.is_dir ? "" : fmtSize(r.size)}
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-1.5 text-slate-400">
+                    {fmtDate(r.modified)}
+                  </td>
+                </tr>
+              );
+            })}
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={3} className="px-3 py-3 text-xs text-slate-600">
+                  (carpeta vacía)
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      <div className="border-t border-slate-700/70 bg-slate-800/40 px-3 py-1 text-xs text-slate-500">
+        {summarize(rows)}
+      </div>
     </div>
   );
 }

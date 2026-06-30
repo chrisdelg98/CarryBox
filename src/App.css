@@ -14,11 +14,12 @@ body {
 
 @layer components {
   .input {
-    @apply rounded border border-slate-600 bg-slate-900 px-2 py-1 text-sm text-slate-100
+    @apply h-9 rounded border border-slate-600 bg-slate-900 px-2.5 text-sm text-slate-100
       outline-none focus:border-sky-500 disabled:opacity-50;
   }
   .btn {
-    @apply rounded px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50;
+    @apply inline-flex h-9 items-center justify-center rounded px-3.5 text-sm font-medium
+      transition-colors disabled:opacity-50;
   }
   .btn-primary {
     @apply bg-sky-600 text-white hover:bg-sky-500;
@@ -26,8 +27,53 @@ body {
   .btn-danger {
     @apply bg-rose-600 text-white hover:bg-rose-500;
   }
+  .btn-secondary {
+    @apply border border-slate-600 bg-slate-700 text-slate-200 hover:bg-slate-600;
+  }
   .btn-mini {
     @apply rounded border border-slate-600 bg-slate-700 px-2 text-xs text-slate-200
       hover:bg-slate-600 disabled:opacity-40;
   }
+  .select {
+    @apply h-9 rounded border border-slate-600 bg-slate-900 px-2.5 text-sm text-slate-100
+      outline-none focus:border-sky-500 disabled:opacity-50;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%2394a3b8' stroke-width='1.6'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 9px center;
+    background-size: 13px;
+    padding-right: 28px;
+  }
+}
+
+/* Scrollbars finos y discretos (no los gruesos por defecto del WebView) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #3f4d61 transparent;
+}
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: #3f4d61;
+  border-radius: 8px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: #586a82;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Opciones del desplegable en tema oscuro */
+.select option {
+  background: #0f172a;
+  color: #e2e8f0;
 }
