@@ -262,10 +262,11 @@ impl RemoteSource for S3Source {
             });
         }
 
-        // --- Subida multipart (streaming desde disco, una parte a la vez) ---
-        // Parte >= 32MB y calculada para no pasar de 9500 partes (limite S3 = 10000).
+        // --- Subida multipart en PARALELO (streaming desde disco) ---
+        // Parte >= 16MB (completa mas seguido -> progreso mas fluido) y calculada
+        // para no pasar de ~9500 partes (limite S3 = 10000).
         let part_size: usize = {
-            let min = 32 * 1024 * 1024u64;
+            let min = 16 * 1024 * 1024u64;
             let needed = size / 9500 + 1;
             let ps = min.max(needed);
             (ps.div_ceil(1024 * 1024) * (1024 * 1024)) as usize
@@ -273,7 +274,13 @@ impl RemoteSource for S3Source {
 
         self.rt.block_on(async move {
             use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+            use std::sync::Arc;
             use tokio::io::AsyncReadExt;
+            use tokio::sync::Semaphore;
+            use tokio::task::JoinSet;
+
+            // Cuantas partes se suben en PARALELO (mas = mas rapido, mas RAM ~= N*parte).
+            const CONCURRENCY: usize = 8;
 
             let create = client
                 .create_multipart_upload()
@@ -301,65 +308,137 @@ impl RemoteSource for S3Source {
             let mut file = tokio::fs::File::open(&local)
                 .await
                 .map_err(|e| format!("No se pudo abrir el archivo local: {e}"))?;
+            let sem = Arc::new(Semaphore::new(CONCURRENCY));
+            let mut tasks: JoinSet<(i32, Result<String, String>, u64)> = JoinSet::new();
             let mut parts: Vec<CompletedPart> = Vec::new();
             let mut part_num: i32 = 1;
-            let mut total: u64 = 0;
+            let mut completed: u64 = 0;
+            let mut failed: Option<String> = None;
+            let mut cancelled = false;
             on_progress(0);
 
+            // Procesa el resultado de una parte terminada.
+            fn handle(
+                r: Result<(i32, Result<String, String>, u64), tokio::task::JoinError>,
+                parts: &mut Vec<aws_sdk_s3::types::CompletedPart>,
+                completed: &mut u64,
+                failed: &mut Option<String>,
+            ) {
+                match r {
+                    Ok((num, Ok(etag), len)) => {
+                        parts.push(
+                            aws_sdk_s3::types::CompletedPart::builder()
+                                .e_tag(etag)
+                                .part_number(num)
+                                .build(),
+                        );
+                        *completed += len;
+                    }
+                    Ok((_, Err(e), _)) => {
+                        if failed.is_none() {
+                            *failed = Some(e);
+                        }
+                    }
+                    Err(e) => {
+                        if failed.is_none() {
+                            *failed = Some(format!("tarea fallo: {e}"));
+                        }
+                    }
+                }
+            }
+
             loop {
-                // Leer hasta part_size bytes desde el disco (solo esta parte en RAM).
+                // Leer una parte desde el disco (solo esta parte en RAM).
                 let mut buf = vec![0u8; part_size];
                 let mut filled = 0usize;
+                let mut read_err: Option<String> = None;
                 while filled < part_size {
                     match file.read(&mut buf[filled..]).await {
                         Ok(0) => break,
                         Ok(n) => filled += n,
                         Err(e) => {
-                            abort(&client, &bucket, &key, &upload_id).await;
-                            return Err(format!("Error leyendo el archivo: {e}"));
+                            read_err = Some(format!("Error leyendo el archivo: {e}"));
+                            break;
                         }
                     }
+                }
+                if let Some(e) = read_err {
+                    failed = Some(e);
+                    break;
                 }
                 if filled == 0 {
                     break;
                 }
                 buf.truncate(filled);
+                let is_last = filled < part_size;
 
-                let up = client
-                    .upload_part()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .upload_id(&upload_id)
-                    .part_number(part_num)
-                    .body(ByteStream::from(buf))
-                    .send()
-                    .await;
-                let up = match up {
-                    Ok(u) => u,
-                    Err(e) => {
-                        abort(&client, &bucket, &key, &upload_id).await;
-                        return Err(format!("Fallo al subir la parte {part_num}: {}", s3_err(e)));
-                    }
-                };
-                let etag = up.e_tag().unwrap_or_default().to_string();
-                parts.push(
-                    CompletedPart::builder()
-                        .e_tag(etag)
-                        .part_number(part_num)
-                        .build(),
-                );
-                total += filled as u64;
-                if !on_progress(total) {
-                    abort(&client, &bucket, &key, &upload_id).await;
-                    return Err("Cancelado".to_string());
+                // Limitar partes en vuelo; mientras esperamos, drenar terminadas.
+                let permit = sem.clone().acquire_owned().await.unwrap();
+                while let Some(r) = tasks.try_join_next() {
+                    handle(r, &mut parts, &mut completed, &mut failed);
                 }
+                if failed.is_some() {
+                    drop(permit);
+                    break;
+                }
+                if !on_progress(completed) {
+                    cancelled = true;
+                    drop(permit);
+                    break;
+                }
+
+                let c = client.clone();
+                let b = bucket.clone();
+                let k = key.clone();
+                let uid = upload_id.clone();
+                let n = part_num;
+                let len = filled as u64;
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let res = c
+                        .upload_part()
+                        .bucket(&b)
+                        .key(&k)
+                        .upload_id(&uid)
+                        .part_number(n)
+                        .body(ByteStream::from(buf))
+                        .send()
+                        .await;
+                    match res {
+                        Ok(u) => (n, Ok(u.e_tag().unwrap_or_default().to_string()), len),
+                        Err(e) => (
+                            n,
+                            Err(format!("Fallo al subir la parte {n}: {}", s3_err(e))),
+                            len,
+                        ),
+                    }
+                });
                 part_num += 1;
-                if filled < part_size {
-                    break; // ultima parte (mas corta)
+                if is_last {
+                    break;
                 }
             }
 
-            let completed = CompletedMultipartUpload::builder()
+            // Esperar a las partes que quedan en vuelo.
+            while let Some(r) = tasks.join_next().await {
+                handle(r, &mut parts, &mut completed, &mut failed);
+                if failed.is_none() && !cancelled {
+                    on_progress(completed);
+                }
+            }
+
+            if cancelled {
+                abort(&client, &bucket, &key, &upload_id).await;
+                return Err("Cancelado".to_string());
+            }
+            if let Some(e) = failed {
+                abort(&client, &bucket, &key, &upload_id).await;
+                return Err(e);
+            }
+
+            // Las partes deben ir en orden ascendente para completar.
+            parts.sort_by_key(|p| p.part_number().unwrap_or(0));
+            let completed_mp = CompletedMultipartUpload::builder()
                 .set_parts(Some(parts))
                 .build();
             client
@@ -367,7 +446,7 @@ impl RemoteSource for S3Source {
                 .bucket(&bucket)
                 .key(&key)
                 .upload_id(&upload_id)
-                .multipart_upload(completed)
+                .multipart_upload(completed_mp)
                 .send()
                 .await
                 .map_err(|e| format!("No se pudo completar la subida: {}", s3_err(e)))?;

@@ -183,6 +183,8 @@ export default function App() {
   // --- Transferencia en curso ---
   const [xfer, setXfer] = useState<Xfer | null>(null);
   const xferRef = useRef<{ t: number; bytes: number }>({ t: 0, bytes: 0 });
+  // Ultimo dato REAL recibido (para interpolar el progreso suavemente entre eventos).
+  const snapRef = useRef<{ overall: number; total: number; speed: number; t: number } | null>(null);
 
   useEffect(() => {
     logRef.current?.scrollTo(0, logRef.current.scrollHeight);
@@ -215,35 +217,62 @@ export default function App() {
       if (p.state !== "progress") {
         // done | cancelled | error -> cerrar barra y refrescar destino
         setXfer(null);
+        snapRef.current = null;
         if (p.kind === "download") loadLocal(localDir?.path ?? null);
         else openRemote(remotePath);
         return;
       }
-      // velocidad general (a partir de los bytes totales)
+      // velocidad general (promediada a partir de los bytes totales)
       const now = performance.now();
       const prev = xferRef.current;
       let speed = 0;
       if (prev.t && now > prev.t) {
-        speed = ((p.overallTransferred - prev.bytes) * 1000) / (now - prev.t);
+        const inst = ((p.overallTransferred - prev.bytes) * 1000) / (now - prev.t);
+        // suavizar la velocidad para que la cifra no salte tanto
+        speed = snapRef.current ? snapRef.current.speed * 0.6 + inst * 0.4 : inst;
       }
       xferRef.current = { t: now, bytes: p.overallTransferred };
-      setXfer({
+      snapRef.current = { overall: p.overallTransferred, total: p.overallTotal, speed, t: now };
+      setXfer((x) => ({
         kind: p.kind,
         name: p.name,
         transferred: p.transferred,
         total: p.total,
-        overall: p.overallTransferred,
+        overall: Math.max(x?.overall ?? 0, p.overallTransferred),
         overallTotal: p.overallTotal,
         filesDone: p.filesDone,
         totalFiles: p.totalFiles,
         speed,
-      });
+      }));
     });
     return () => {
       un.then((f) => f());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [localDir, remotePath]);
+
+  // Progreso FLUIDO: entre eventos reales, avanzar la barra ~4 veces/seg segun la
+  // velocidad medida (como los clientes de nube). Se corrige con cada evento real.
+  const transferActive = xfer !== null;
+  useEffect(() => {
+    if (!transferActive) return;
+    const id = setInterval(() => {
+      const s = snapRef.current;
+      if (!s || s.speed <= 0) return;
+      const est = Math.min(s.total, s.overall + (s.speed * (performance.now() - s.t)) / 1000);
+      setXfer((x) =>
+        x
+          ? {
+              ...x,
+              overall: Math.max(x.overall, est),
+              transferred:
+                x.totalFiles <= 1 ? Math.max(x.transferred, Math.min(x.total, est)) : x.transferred,
+            }
+          : x,
+      );
+    }, 250);
+    return () => clearInterval(id);
+  }, [transferActive]);
 
   // Cerrar menu al hacer clic en cualquier lado.
   useEffect(() => {
@@ -799,30 +828,46 @@ export default function App() {
         <div className="border-t border-slate-700 bg-slate-800 px-4 py-2">
           <div className="flex items-center gap-4">
             <div className="min-w-0 flex-1">
-              {/* Archivo actual */}
+              {xfer.totalFiles > 1 && (
+                <>
+                  {/* Archivo actual (solo cuando hay varios) */}
+                  <div className="mb-1 flex items-center justify-between text-xs">
+                    <span className="truncate text-slate-200">
+                      {xfer.kind === "download" ? "⬇" : "⬆"} {xfer.name}
+                    </span>
+                    <span className="shrink-0 text-slate-400">{filePct.toFixed(0)}%</span>
+                  </div>
+                  <div className="mb-2 h-1.5 w-full overflow-hidden rounded bg-slate-700">
+                    <div
+                      className="h-full bg-sky-400 transition-all"
+                      style={{ width: `${filePct}%` }}
+                    />
+                  </div>
+                </>
+              )}
+              {/* Barra principal (general, o el archivo unico) */}
               <div className="mb-1 flex items-center justify-between text-xs">
                 <span className="truncate text-slate-200">
-                  {xfer.kind === "download" ? "⬇" : "⬆"} {xfer.name}
-                </span>
-                <span className="shrink-0 text-slate-400">{filePct.toFixed(0)}%</span>
-              </div>
-              <div className="h-1.5 w-full overflow-hidden rounded bg-slate-700">
-                <div className="h-full bg-sky-400 transition-all" style={{ width: `${filePct}%` }} />
-              </div>
-              {/* Avance general */}
-              <div className="mt-2 mb-1 flex items-center justify-between text-xs">
-                <span className="truncate text-slate-400">
-                  General · archivo {Math.min(xfer.filesDone + 1, xfer.totalFiles)} de{" "}
-                  {xfer.totalFiles} · {fmtSize(xfer.overall)} / {fmtSize(xfer.overallTotal)}
+                  {xfer.totalFiles > 1 ? (
+                    <>
+                      General · archivo {Math.min(xfer.filesDone + 1, xfer.totalFiles)} de{" "}
+                      {xfer.totalFiles}
+                    </>
+                  ) : (
+                    <>
+                      {xfer.kind === "download" ? "⬇" : "⬆"} {xfer.name}
+                    </>
+                  )}{" "}
+                  · {fmtSize(xfer.overall)} / {fmtSize(xfer.overallTotal)}
                 </span>
                 <span className="shrink-0 text-slate-400">
-                  {overallPct.toFixed(0)}% · {fmtSpeed(xfer.speed)}
+                  {overallPct.toFixed(1)}% · {fmtSpeed(xfer.speed)}
                   {eta ? ` · ETA ${fmtEta(eta)}` : ""}
                 </span>
               </div>
-              <div className="h-2 w-full overflow-hidden rounded bg-slate-700">
+              <div className="h-2.5 w-full overflow-hidden rounded bg-slate-700">
                 <div
-                  className="h-full bg-sky-500 transition-all"
+                  className="h-full rounded bg-sky-500 transition-all duration-200 ease-linear"
                   style={{ width: `${overallPct}%` }}
                 />
               </div>
