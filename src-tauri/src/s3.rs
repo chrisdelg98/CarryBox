@@ -48,9 +48,9 @@ fn norm_prefix(path: &str) -> String {
     }
 }
 
-/// Mensaje legible de un error de aws-sdk.
-fn s3_err<E: std::fmt::Display>(e: E) -> String {
-    format!("{e}")
+/// Mensaje legible de un error de aws-sdk (incluye la cadena de causas).
+fn s3_err<E: std::error::Error>(e: E) -> String {
+    format!("{}", aws_smithy_types::error::display::DisplayErrorContext(e))
 }
 
 impl RemoteSource for S3Source {
@@ -240,20 +240,137 @@ impl RemoteSource for S3Source {
         let key = remote.trim_start_matches('/').to_string();
         let local = local.to_path_buf();
         let size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+
+        // Archivos chicos: PUT directo. Grandes (>64MB): multipart (obligatorio >5GB).
+        const THRESHOLD: u64 = 64 * 1024 * 1024;
+        if size <= THRESHOLD {
+            return self.rt.block_on(async move {
+                let body = ByteStream::from_path(&local)
+                    .await
+                    .map_err(|e| format!("No se pudo leer el archivo local: {e}"))?;
+                on_progress(0);
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| format!("No se pudo subir: {}", s3_err(e)))?;
+                on_progress(size);
+                Ok(())
+            });
+        }
+
+        // --- Subida multipart (streaming desde disco, una parte a la vez) ---
+        // Parte >= 32MB y calculada para no pasar de 9500 partes (limite S3 = 10000).
+        let part_size: usize = {
+            let min = 32 * 1024 * 1024u64;
+            let needed = size / 9500 + 1;
+            let ps = min.max(needed);
+            (ps.div_ceil(1024 * 1024) * (1024 * 1024)) as usize
+        };
+
         self.rt.block_on(async move {
-            let body = ByteStream::from_path(&local)
-                .await
-                .map_err(|e| format!("No se pudo leer el archivo local: {e}"))?;
-            on_progress(0);
-            client
-                .put_object()
+            use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+            use tokio::io::AsyncReadExt;
+
+            let create = client
+                .create_multipart_upload()
                 .bucket(&bucket)
                 .key(&key)
-                .body(body)
                 .send()
                 .await
-                .map_err(|e| format!("No se pudo subir: {}", s3_err(e)))?;
-            on_progress(size);
+                .map_err(|e| format!("No se pudo iniciar la subida: {}", s3_err(e)))?;
+            let upload_id = create
+                .upload_id()
+                .ok_or("El servidor no devolvio upload_id")?
+                .to_string();
+
+            // Aborta la subida multipart (evita partes huerfanas que cobran espacio).
+            async fn abort(client: &Client, bucket: &str, key: &str, upload_id: &str) {
+                let _ = client
+                    .abort_multipart_upload()
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await;
+            }
+
+            let mut file = tokio::fs::File::open(&local)
+                .await
+                .map_err(|e| format!("No se pudo abrir el archivo local: {e}"))?;
+            let mut parts: Vec<CompletedPart> = Vec::new();
+            let mut part_num: i32 = 1;
+            let mut total: u64 = 0;
+            on_progress(0);
+
+            loop {
+                // Leer hasta part_size bytes desde el disco (solo esta parte en RAM).
+                let mut buf = vec![0u8; part_size];
+                let mut filled = 0usize;
+                while filled < part_size {
+                    match file.read(&mut buf[filled..]).await {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(e) => {
+                            abort(&client, &bucket, &key, &upload_id).await;
+                            return Err(format!("Error leyendo el archivo: {e}"));
+                        }
+                    }
+                }
+                if filled == 0 {
+                    break;
+                }
+                buf.truncate(filled);
+
+                let up = client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .part_number(part_num)
+                    .body(ByteStream::from(buf))
+                    .send()
+                    .await;
+                let up = match up {
+                    Ok(u) => u,
+                    Err(e) => {
+                        abort(&client, &bucket, &key, &upload_id).await;
+                        return Err(format!("Fallo al subir la parte {part_num}: {}", s3_err(e)));
+                    }
+                };
+                let etag = up.e_tag().unwrap_or_default().to_string();
+                parts.push(
+                    CompletedPart::builder()
+                        .e_tag(etag)
+                        .part_number(part_num)
+                        .build(),
+                );
+                total += filled as u64;
+                if !on_progress(total) {
+                    abort(&client, &bucket, &key, &upload_id).await;
+                    return Err("Cancelado".to_string());
+                }
+                part_num += 1;
+                if filled < part_size {
+                    break; // ultima parte (mas corta)
+                }
+            }
+
+            let completed = CompletedMultipartUpload::builder()
+                .set_parts(Some(parts))
+                .build();
+            client
+                .complete_multipart_upload()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .multipart_upload(completed)
+                .send()
+                .await
+                .map_err(|e| format!("No se pudo completar la subida: {}", s3_err(e)))?;
             Ok(())
         })
     }
