@@ -5,11 +5,77 @@
 //! En S3 no hay carpetas reales: se emulan con prefijos y delimitador "/".
 
 use crate::remote::{ConnConfig, ProgressFn, RemoteEntry, RemoteSource};
+use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use tokio::runtime::Runtime;
+
+/// Estado de una subida multipart en curso, para poder REANUDAR tras un corte.
+#[derive(Serialize, Deserialize)]
+struct UploadState {
+    bucket: String,
+    key: String,
+    upload_id: String,
+    file_size: u64,
+    mtime_secs: u64,
+    part_size: u64,
+}
+
+/// Ruta del archivo de estado (unos KB) en %APPDATA%\CarryBox\uploads\.
+fn upload_state_path(bucket: &str, key: &str) -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)?;
+    let dir = base.join("CarryBox").join("uploads");
+    let _ = std::fs::create_dir_all(&dir);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bucket.hash(&mut h);
+    key.hash(&mut h);
+    Some(dir.join(format!("{:016x}.json", h.finish())))
+}
+
+fn save_upload_state(path: &Path, st: &UploadState) {
+    if let Ok(txt) = serde_json::to_string(st) {
+        let _ = std::fs::write(path, txt);
+    }
+}
+
+/// Partes ya subidas segun S3 (fuente de verdad): num -> etag.
+async fn list_uploaded_parts(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<HashMap<i32, String>, String> {
+    let mut map = HashMap::new();
+    let mut marker: Option<String> = None;
+    loop {
+        let mut req = client.list_parts().bucket(bucket).key(key).upload_id(upload_id);
+        if let Some(m) = &marker {
+            req = req.part_number_marker(m);
+        }
+        let out = req.send().await.map_err(|e| s3_err(e))?;
+        for p in out.parts() {
+            if let Some(n) = p.part_number() {
+                map.insert(n, p.e_tag().unwrap_or_default().to_string());
+            }
+        }
+        if out.is_truncated().unwrap_or(false) {
+            marker = out.next_part_number_marker().map(|s| s.to_string());
+            if marker.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    Ok(map)
+}
 
 pub struct S3Source {
     rt: Runtime,
@@ -77,6 +143,9 @@ impl RemoteSource for S3Source {
                 .endpoint_url(endpoint)
                 .credentials_provider(creds)
                 .force_path_style(path_style)
+                // Reintentos automaticos con backoff ante errores transitorios
+                // (cortes, 5xx, throttling). Clave para "que nunca deje de subir".
+                .retry_config(RetryConfig::standard().with_max_attempts(6))
                 .build();
             let client = Client::from_conf(conf);
             // Pre-flight: valida credenciales + acceso al bucket.
@@ -275,26 +344,22 @@ impl RemoteSource for S3Source {
         self.rt.block_on(async move {
             use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
             use std::sync::Arc;
-            use tokio::io::AsyncReadExt;
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
             use tokio::sync::Semaphore;
             use tokio::task::JoinSet;
 
             // Cuantas partes se suben en PARALELO (mas = mas rapido, mas RAM ~= N*parte).
             const CONCURRENCY: usize = 8;
 
-            let create = client
-                .create_multipart_upload()
-                .bucket(&bucket)
-                .key(&key)
-                .send()
-                .await
-                .map_err(|e| format!("No se pudo iniciar la subida: {}", s3_err(e)))?;
-            let upload_id = create
-                .upload_id()
-                .ok_or("El servidor no devolvio upload_id")?
-                .to_string();
+            let mtime = std::fs::metadata(&local)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let num_parts = size.div_ceil(part_size as u64) as i32;
+            let state_path = upload_state_path(&bucket, &key);
 
-            // Aborta la subida multipart (evita partes huerfanas que cobran espacio).
             async fn abort(client: &Client, bucket: &str, key: &str, upload_id: &str) {
                 let _ = client
                     .abort_multipart_upload()
@@ -305,19 +370,82 @@ impl RemoteSource for S3Source {
                     .await;
             }
 
+            // --- REANUDAR: si hay estado guardado que coincide, retomar el upload_id ---
+            let mut upload_id = String::new();
+            let mut done_parts: HashMap<i32, String> = HashMap::new();
+            if let Some(sp) = &state_path {
+                if let Some(st) = std::fs::read_to_string(sp)
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<UploadState>(&t).ok())
+                {
+                    if st.bucket == bucket
+                        && st.key == key
+                        && st.file_size == size
+                        && st.mtime_secs == mtime
+                        && st.part_size == part_size as u64
+                    {
+                        // Confirmar con S3 que las partes siguen ahi.
+                        if let Ok(listed) =
+                            list_uploaded_parts(&client, &bucket, &key, &st.upload_id).await
+                        {
+                            upload_id = st.upload_id;
+                            done_parts = listed;
+                        }
+                    }
+                }
+            }
+
+            // Si no se pudo reanudar, iniciar una subida nueva y guardar el estado.
+            if upload_id.is_empty() {
+                let create = client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map_err(|e| format!("No se pudo iniciar la subida: {}", s3_err(e)))?;
+                upload_id = create
+                    .upload_id()
+                    .ok_or("El servidor no devolvio upload_id")?
+                    .to_string();
+                if let Some(sp) = &state_path {
+                    save_upload_state(
+                        sp,
+                        &UploadState {
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            upload_id: upload_id.clone(),
+                            file_size: size,
+                            mtime_secs: mtime,
+                            part_size: part_size as u64,
+                        },
+                    );
+                }
+            }
+
             let mut file = tokio::fs::File::open(&local)
                 .await
                 .map_err(|e| format!("No se pudo abrir el archivo local: {e}"))?;
             let sem = Arc::new(Semaphore::new(CONCURRENCY));
             let mut tasks: JoinSet<(i32, Result<String, String>, u64)> = JoinSet::new();
             let mut parts: Vec<CompletedPart> = Vec::new();
-            let mut part_num: i32 = 1;
             let mut completed: u64 = 0;
             let mut failed: Option<String> = None;
             let mut cancelled = false;
-            on_progress(0);
 
-            // Procesa el resultado de una parte terminada.
+            // Contar/registrar las partes que ya estaban subidas (reanudacion).
+            for (num, etag) in &done_parts {
+                let off = (*num as u64 - 1) * part_size as u64;
+                completed += (size - off).min(part_size as u64);
+                parts.push(
+                    CompletedPart::builder()
+                        .e_tag(etag)
+                        .part_number(*num)
+                        .build(),
+                );
+            }
+            on_progress(completed);
+
             fn handle(
                 r: Result<(i32, Result<String, String>, u64), tokio::task::JoinError>,
                 parts: &mut Vec<aws_sdk_s3::types::CompletedPart>,
@@ -347,32 +475,13 @@ impl RemoteSource for S3Source {
                 }
             }
 
-            loop {
-                // Leer una parte desde el disco (solo esta parte en RAM).
-                let mut buf = vec![0u8; part_size];
-                let mut filled = 0usize;
-                let mut read_err: Option<String> = None;
-                while filled < part_size {
-                    match file.read(&mut buf[filled..]).await {
-                        Ok(0) => break,
-                        Ok(n) => filled += n,
-                        Err(e) => {
-                            read_err = Some(format!("Error leyendo el archivo: {e}"));
-                            break;
-                        }
-                    }
+            for part_num in 1..=num_parts {
+                if done_parts.contains_key(&part_num) {
+                    continue; // ya subida (reanudacion)
                 }
-                if let Some(e) = read_err {
-                    failed = Some(e);
-                    break;
-                }
-                if filled == 0 {
-                    break;
-                }
-                buf.truncate(filled);
-                let is_last = filled < part_size;
+                let offset = (part_num as u64 - 1) * part_size as u64;
+                let this_len = (size - offset).min(part_size as u64) as usize;
 
-                // Limitar partes en vuelo; mientras esperamos, drenar terminadas.
                 let permit = sem.clone().acquire_owned().await.unwrap();
                 while let Some(r) = tasks.try_join_next() {
                     handle(r, &mut parts, &mut completed, &mut failed);
@@ -387,14 +496,28 @@ impl RemoteSource for S3Source {
                     break;
                 }
 
+                // Leer EXACTAMENTE esta parte desde su offset (streaming desde disco).
+                if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+                    failed = Some(format!("Error posicionando el archivo: {e}"));
+                    drop(permit);
+                    break;
+                }
+                let mut buf = vec![0u8; this_len];
+                if let Err(e) = file.read_exact(&mut buf).await {
+                    failed = Some(format!("Error leyendo el archivo: {e}"));
+                    drop(permit);
+                    break;
+                }
+
                 let c = client.clone();
                 let b = bucket.clone();
                 let k = key.clone();
                 let uid = upload_id.clone();
                 let n = part_num;
-                let len = filled as u64;
+                let len = this_len as u64;
                 tasks.spawn(async move {
                     let _permit = permit;
+                    // El cliente reintenta solo (retry_config); el body en RAM es reejecutable.
                     let res = c
                         .upload_part()
                         .bucket(&b)
@@ -413,13 +536,9 @@ impl RemoteSource for S3Source {
                         ),
                     }
                 });
-                part_num += 1;
-                if is_last {
-                    break;
-                }
             }
 
-            // Esperar a las partes que quedan en vuelo.
+            // Esperar a las partes en vuelo.
             while let Some(r) = tasks.join_next().await {
                 handle(r, &mut parts, &mut completed, &mut failed);
                 if failed.is_none() && !cancelled {
@@ -428,11 +547,15 @@ impl RemoteSource for S3Source {
             }
 
             if cancelled {
+                // Cancelacion del usuario: abortar y limpiar (no se reanuda).
                 abort(&client, &bucket, &key, &upload_id).await;
+                if let Some(sp) = &state_path {
+                    let _ = std::fs::remove_file(sp);
+                }
                 return Err("Cancelado".to_string());
             }
             if let Some(e) = failed {
-                abort(&client, &bucket, &key, &upload_id).await;
+                // Fallo de red: NO abortamos ni borramos el estado -> se REANUDA luego.
                 return Err(e);
             }
 
@@ -450,6 +573,26 @@ impl RemoteSource for S3Source {
                 .send()
                 .await
                 .map_err(|e| format!("No se pudo completar la subida: {}", s3_err(e)))?;
+
+            // VERIFICACION FINAL: el tamano en S3 debe coincidir con el local.
+            let head = client
+                .head_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| format!("No se pudo verificar la subida: {}", s3_err(e)))?;
+            let remote_size = head.content_length().unwrap_or(-1);
+            if remote_size != size as i64 {
+                return Err(format!(
+                    "Verificacion FALLIDA: en S3 hay {remote_size} bytes pero el original tiene {size}. La subida NO es confiable."
+                ));
+            }
+
+            // Exito verificado -> borrar el estado de reanudacion.
+            if let Some(sp) = &state_path {
+                let _ = std::fs::remove_file(sp);
+            }
             Ok(())
         })
     }
