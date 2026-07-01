@@ -168,6 +168,8 @@ struct Xfer {
     files_done: u64,
     bytes_done: u64, // bytes de archivos ya completados
     last_emit: Instant,
+    /// Primer error de un archivo omitido (para avisar al final).
+    error: Option<String>,
 }
 
 impl Xfer {
@@ -589,6 +591,9 @@ fn do_download(
                 }
                 reconnect_source(src, config, &ctx.cancel_handle, &ctx.app);
                 emit(&ctx.app, "error", format!("Omitido \"{name}\": {e}"));
+                if ctx.error.is_none() {
+                    ctx.error = Some(format!("{name}: {e}"));
+                }
             }
         }
         ctx.bytes_done += size;
@@ -693,6 +698,9 @@ fn do_upload(
                 }
                 reconnect_source(src, config, &ctx.cancel_handle, &ctx.app);
                 emit(&ctx.app, "error", format!("Omitido \"{name}\": {e}"));
+                if ctx.error.is_none() {
+                    ctx.error = Some(format!("{name}: {e}"));
+                }
             }
         }
         ctx.bytes_done += size;
@@ -753,6 +761,7 @@ async fn remote_download(
             files_done: 0,
             bytes_done: 0,
             last_emit: Instant::now(),
+            error: None,
         };
         let base = PathBuf::from(&local_dir);
         for it in &items {
@@ -772,8 +781,13 @@ async fn remote_download(
                 return Err(e);
             }
         }
-        emit(&app, "status", "Descarga completada.");
-        ctx.emit("done", "", 0, 0);
+        if let Some(err) = ctx.error.clone() {
+            emit(&app, "error", format!("La descarga no se completo: {err}"));
+            ctx.emit("error", &err, 0, 0);
+        } else {
+            emit(&app, "status", "Descarga completada.");
+            ctx.emit("done", "", 0, 0);
+        }
         Ok(())
     })
     .await
@@ -824,6 +838,7 @@ async fn remote_upload(
             files_done: 0,
             bytes_done: 0,
             last_emit: Instant::now(),
+            error: None,
         };
         for it in &items {
             emit(&app, "status", format!("Subiendo: {}", it.name));
@@ -849,8 +864,13 @@ async fn remote_upload(
                 return Err(e);
             }
         }
-        emit(&app, "status", "Subida completada.");
-        ctx.emit("done", "", 0, 0);
+        if let Some(err) = ctx.error.clone() {
+            emit(&app, "error", format!("La subida no se completo: {err}"));
+            ctx.emit("error", &err, 0, 0);
+        } else {
+            emit(&app, "status", "Subida completada.");
+            ctx.emit("done", "", 0, 0);
+        }
         Ok(())
     })
     .await

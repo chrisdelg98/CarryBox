@@ -344,11 +344,11 @@ impl RemoteSource for S3Source {
         self.rt.block_on(async move {
             use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
             use std::sync::Arc;
-            use tokio::io::{AsyncReadExt, AsyncSeekExt};
             use tokio::sync::Semaphore;
             use tokio::task::JoinSet;
 
-            // Cuantas partes se suben en PARALELO (mas = mas rapido, mas RAM ~= N*parte).
+            // Concurrencia optima medida: 8 satura el ancho de banda de subida (mas
+            // conexiones NO aceleran, solo agrandan las rafagas). ~8 * 16MB = 128MB pico.
             const CONCURRENCY: usize = 8;
 
             let mtime = std::fs::metadata(&local)
@@ -423,9 +423,6 @@ impl RemoteSource for S3Source {
                 }
             }
 
-            let mut file = tokio::fs::File::open(&local)
-                .await
-                .map_err(|e| format!("No se pudo abrir el archivo local: {e}"))?;
             let sem = Arc::new(Semaphore::new(CONCURRENCY));
             let mut tasks: JoinSet<(i32, Result<String, String>, u64)> = JoinSet::new();
             let mut parts: Vec<CompletedPart> = Vec::new();
@@ -475,14 +472,72 @@ impl RemoteSource for S3Source {
                 }
             }
 
-            for part_num in 1..=num_parts {
-                if done_parts.contains_key(&part_num) {
-                    continue; // ya subida (reanudacion)
+            // PRODUCTOR: un hilo lee por adelantado (prefetch) las siguientes partes
+            // desde el disco y las deja en una cola, para que las subidas NUNCA esperen
+            // al disco. La cola acotada limita la RAM (backpressure).
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(i32, Vec<u8>)>(4);
+            let reader_local = local.clone();
+            let done_set: std::collections::HashSet<i32> = done_parts.keys().copied().collect();
+            let ps = part_size;
+            let reader = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = std::fs::File::open(&reader_local)
+                    .map_err(|e| format!("No se pudo abrir el archivo local: {e}"))?;
+                for part_num in 1..=num_parts {
+                    if done_set.contains(&part_num) {
+                        continue; // ya subida (reanudacion)
+                    }
+                    let offset = (part_num as u64 - 1) * ps as u64;
+                    let this_len = (size - offset).min(ps as u64) as usize;
+                    if f.seek(SeekFrom::Start(offset)).is_err() {
+                        return Err("Error posicionando el archivo".to_string());
+                    }
+                    let mut buf = vec![0u8; this_len];
+                    let tr = std::time::Instant::now();
+                    if f.read_exact(&mut buf).is_err() {
+                        return Err("Error leyendo el archivo".to_string());
+                    }
+                    let rd_ms = tr.elapsed().as_millis();
+                    if rd_ms > 120 {
+                        eprintln!(
+                            "[carrybox] LECTURA parte {part_num} ({} KB): {rd_ms}ms (disco lento)",
+                            this_len / 1024
+                        );
+                    }
+                    let ts = std::time::Instant::now();
+                    if tx.blocking_send((part_num, buf)).is_err() {
+                        break; // el consumidor se detuvo (cancel/error)
+                    }
+                    let send_ms = ts.elapsed().as_millis();
+                    if send_ms > 120 {
+                        eprintln!("[carrybox] COLA LLENA en parte {part_num}: el lector espero {send_ms}ms (las subidas van mas lento que el disco)");
+                    }
                 }
-                let offset = (part_num as u64 - 1) * part_size as u64;
-                let this_len = (size - offset).min(part_size as u64) as usize;
+                Ok(())
+            });
 
+            // CONSUMIDOR: recibe partes ya leidas (listas) y las sube en paralelo.
+            eprintln!(
+                "[carrybox] multipart INICIO: {} partes de {} MB, concurrencia {}",
+                num_parts,
+                part_size / 1024 / 1024,
+                CONCURRENCY
+            );
+            loop {
+                let t_recv = std::time::Instant::now();
+                let Some((part_num, buf)) = rx.recv().await else {
+                    break;
+                };
+                let recv_ms = t_recv.elapsed().as_millis();
+                let t_slot = std::time::Instant::now();
                 let permit = sem.clone().acquire_owned().await.unwrap();
+                let slot_ms = t_slot.elapsed().as_millis();
+                if recv_ms > 120 || slot_ms > 120 {
+                    eprintln!(
+                        "[carrybox] parte {part_num}: espera_cola={recv_ms}ms espera_slot={slot_ms}ms (cola pendiente={})",
+                        rx.len()
+                    );
+                }
                 while let Some(r) = tasks.try_join_next() {
                     handle(r, &mut parts, &mut completed, &mut failed);
                 }
@@ -496,27 +551,15 @@ impl RemoteSource for S3Source {
                     break;
                 }
 
-                // Leer EXACTAMENTE esta parte desde su offset (streaming desde disco).
-                if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
-                    failed = Some(format!("Error posicionando el archivo: {e}"));
-                    drop(permit);
-                    break;
-                }
-                let mut buf = vec![0u8; this_len];
-                if let Err(e) = file.read_exact(&mut buf).await {
-                    failed = Some(format!("Error leyendo el archivo: {e}"));
-                    drop(permit);
-                    break;
-                }
-
                 let c = client.clone();
                 let b = bucket.clone();
                 let k = key.clone();
                 let uid = upload_id.clone();
                 let n = part_num;
-                let len = this_len as u64;
+                let len = buf.len() as u64;
                 tasks.spawn(async move {
                     let _permit = permit;
+                    let tu = std::time::Instant::now();
                     // El cliente reintenta solo (retry_config); el body en RAM es reejecutable.
                     let res = c
                         .upload_part()
@@ -527,6 +570,10 @@ impl RemoteSource for S3Source {
                         .body(ByteStream::from(buf))
                         .send()
                         .await;
+                    let up_ms = tu.elapsed().as_millis();
+                    if up_ms > 900 {
+                        eprintln!("[carrybox] SUBIDA parte {n} ({} KB): {up_ms}ms", len / 1024);
+                    }
                     match res {
                         Ok(u) => (n, Ok(u.e_tag().unwrap_or_default().to_string()), len),
                         Err(e) => (
@@ -537,12 +584,28 @@ impl RemoteSource for S3Source {
                     }
                 });
             }
+            drop(rx); // liberar al productor si salimos temprano
 
             // Esperar a las partes en vuelo.
             while let Some(r) = tasks.join_next().await {
                 handle(r, &mut parts, &mut completed, &mut failed);
                 if failed.is_none() && !cancelled {
                     on_progress(completed);
+                }
+            }
+
+            // Propagar un posible error de lectura del productor.
+            match reader.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if failed.is_none() && !cancelled {
+                        failed = Some(e);
+                    }
+                }
+                Err(e) => {
+                    if failed.is_none() && !cancelled {
+                        failed = Some(format!("lector: {e}"));
+                    }
                 }
             }
 

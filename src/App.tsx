@@ -183,8 +183,16 @@ export default function App() {
   // --- Transferencia en curso ---
   const [xfer, setXfer] = useState<Xfer | null>(null);
   const xferRef = useRef<{ t: number; bytes: number }>({ t: 0, bytes: 0 });
+  // Muestras (tiempo, bytes) para calcular velocidad promedio en ventana (estable).
+  const speedSamplesRef = useRef<{ t: number; bytes: number }[]>([]);
   // Ultimo dato REAL recibido (para interpolar el progreso suavemente entre eventos).
   const snapRef = useRef<{ overall: number; total: number; speed: number; t: number } | null>(null);
+  // Ultima transferencia lanzada (para poder REINTENTAR/reanudar si se detiene).
+  const lastTransferRef = useRef<{
+    kind: "download" | "upload";
+    items: { name: string; path: string; is_dir: boolean; size: number }[];
+    dest: string;
+  } | null>(null);
 
   useEffect(() => {
     logRef.current?.scrollTo(0, logRef.current.scrollHeight);
@@ -220,18 +228,28 @@ export default function App() {
         snapRef.current = null;
         if (p.kind === "download") loadLocal(localDir?.path ?? null);
         else openRemote(remotePath);
+        if (p.state === "error") {
+          const msg = p.name || "se detuvo la transferencia";
+          askConfirm(
+            `La transferencia se detuvo (${msg}). Puede ser tu conexión a internet. ¿Reintentar? Se reanudará desde donde iba, sin volver a subir lo ya hecho.`,
+          ).then((ok) => {
+            if (ok) retryLast();
+          });
+        }
         return;
       }
-      // velocidad general (promediada a partir de los bytes totales)
+      // Velocidad = bytes subidos en los ultimos ~5s (ventana movil, estable pese a
+      // que las partes terminen en rafagas). Asi la barra avanza pareja.
       const now = performance.now();
-      const prev = xferRef.current;
+      const samples = speedSamplesRef.current;
+      samples.push({ t: now, bytes: p.overallTransferred });
+      while (samples.length > 2 && now - samples[0].t > 5000) samples.shift();
       let speed = 0;
-      if (prev.t && now > prev.t) {
-        const inst = ((p.overallTransferred - prev.bytes) * 1000) / (now - prev.t);
-        // suavizar la velocidad para que la cifra no salte tanto
-        speed = snapRef.current ? snapRef.current.speed * 0.6 + inst * 0.4 : inst;
+      if (samples.length >= 2) {
+        const first = samples[0];
+        const dt = (now - first.t) / 1000;
+        if (dt > 0.3) speed = (p.overallTransferred - first.bytes) / dt;
       }
-      xferRef.current = { t: now, bytes: p.overallTransferred };
       snapRef.current = { overall: p.overallTransferred, total: p.overallTotal, speed, t: now };
       setXfer((x) => ({
         kind: p.kind,
@@ -433,7 +451,10 @@ export default function App() {
   async function downloadItems(rows: ItemRow[]) {
     if (!connected || !localDir) return;
     xferRef.current = { t: 0, bytes: 0 };
-    await invoke("remote_download", { items: toItems(rows), localDir: localDir.path }).catch((e) =>
+    speedSamplesRef.current = [];
+    const items = toItems(rows);
+    lastTransferRef.current = { kind: "download", items, dest: localDir.path };
+    await invoke("remote_download", { items, localDir: localDir.path }).catch((e) =>
       addLog("error", `${e}`),
     );
   }
@@ -462,11 +483,32 @@ export default function App() {
       conflictPolicy = chosen as ConflictPolicy;
     }
     xferRef.current = { t: 0, bytes: 0 };
+    speedSamplesRef.current = [];
+    const items = toItems(rows);
+    lastTransferRef.current = { kind: "upload", items, dest: remotePath };
     await invoke("remote_upload", {
-      items: toItems(rows),
+      items,
       remoteDir: remotePath,
       conflictPolicy,
     }).catch((e) => addLog("error", `${e}`));
+  }
+
+  // Reintentar/reanudar la última transferencia (se retoma desde donde iba).
+  function retryLast() {
+    const t = lastTransferRef.current;
+    if (!t) return;
+    xferRef.current = { t: 0, bytes: 0 };
+    speedSamplesRef.current = [];
+    addLog("status", "Reintentando…");
+    if (t.kind === "download") {
+      invoke("remote_download", { items: t.items, localDir: t.dest }).catch((e) =>
+        addLog("error", `${e}`),
+      );
+    } else {
+      invoke("remote_upload", { items: t.items, remoteDir: t.dest, conflictPolicy: "replace" }).catch(
+        (e) => addLog("error", `${e}`),
+      );
+    }
   }
 
   // ---- Acciones de gestión ----
