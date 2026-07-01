@@ -45,6 +45,150 @@ fn save_upload_state(path: &Path, st: &UploadState) {
     }
 }
 
+/// Construye un cliente S3 a partir de la config (sin conectar; es sincrono).
+fn build_client(cfg: &ConnConfig) -> Client {
+    let creds = Credentials::new(
+        cfg.access_key.clone(),
+        cfg.secret_key.clone(),
+        None,
+        None,
+        "carrybox",
+    );
+    let region = if cfg.region.is_empty() {
+        "us-east-1".to_string()
+    } else {
+        cfg.region.clone()
+    };
+    let conf = aws_sdk_s3::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new(region))
+        .endpoint_url(cfg.endpoint.clone())
+        .credentials_provider(creds)
+        .force_path_style(cfg.path_style)
+        .retry_config(RetryConfig::standard().with_max_attempts(6))
+        .build();
+    Client::from_conf(conf)
+}
+
+/// Info de una subida multipart en progreso (invisible en el bucket hasta completar).
+#[derive(Serialize)]
+pub struct IncompleteUpload {
+    pub key: String,
+    pub upload_id: String,
+    pub bytes: u64,
+    pub parts: u32,
+    pub initiated: Option<u64>,
+}
+
+async fn sum_parts(client: &Client, bucket: &str, key: &str, upload_id: &str) -> (u32, u64) {
+    let (mut count, mut bytes) = (0u32, 0u64);
+    let mut marker: Option<String> = None;
+    loop {
+        let mut req = client.list_parts().bucket(bucket).key(key).upload_id(upload_id);
+        if let Some(m) = &marker {
+            req = req.part_number_marker(m);
+        }
+        let out = match req.send().await {
+            Ok(o) => o,
+            Err(_) => break,
+        };
+        for p in out.parts() {
+            count += 1;
+            bytes += p.size().unwrap_or(0).max(0) as u64;
+        }
+        if out.is_truncated().unwrap_or(false) {
+            marker = out.next_part_number_marker().map(|s| s.to_string());
+            if marker.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    (count, bytes)
+}
+
+/// Lista las subidas multipart en progreso del bucket (con bytes/pedazos ya subidos).
+pub fn list_incomplete(cfg: &ConnConfig, rt: &Runtime) -> Result<Vec<IncompleteUpload>, String> {
+    let client = build_client(cfg);
+    let bucket = cfg.bucket.clone();
+    rt.block_on(async move {
+        let mut out = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut id_marker: Option<String> = None;
+        loop {
+            let mut req = client.list_multipart_uploads().bucket(&bucket);
+            if let Some(k) = &key_marker {
+                req = req.key_marker(k);
+            }
+            if let Some(i) = &id_marker {
+                req = req.upload_id_marker(i);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| format!("No se pudo listar subidas en progreso: {}", s3_err(e)))?;
+            for u in resp.uploads() {
+                let key = u.key().unwrap_or("").to_string();
+                let uid = u.upload_id().unwrap_or("").to_string();
+                let initiated = u.initiated().map(|d| d.secs().max(0) as u64);
+                let (parts, bytes) = sum_parts(&client, &bucket, &key, &uid).await;
+                out.push(IncompleteUpload {
+                    key,
+                    upload_id: uid,
+                    bytes,
+                    parts,
+                    initiated,
+                });
+            }
+            if resp.is_truncated().unwrap_or(false) {
+                key_marker = resp.next_key_marker().map(|s| s.to_string());
+                id_marker = resp.next_upload_id_marker().map(|s| s.to_string());
+                if key_marker.is_none() && id_marker.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Aborta una subida en progreso (S3 borra sus pedazos) y limpia el estado local.
+pub fn abort_upload(cfg: &ConnConfig, rt: &Runtime, key: &str, upload_id: &str) -> Result<(), String> {
+    let client = build_client(cfg);
+    let bucket = cfg.bucket.clone();
+    let (k, uid) = (key.to_string(), upload_id.to_string());
+    rt.block_on(async move {
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(&k)
+            .upload_id(&uid)
+            .send()
+            .await
+            .map_err(|e| format!("No se pudo abortar: {}", s3_err(e)))?;
+        Ok::<_, String>(())
+    })?;
+    if let Some(sp) = upload_state_path(&cfg.bucket, key) {
+        let _ = std::fs::remove_file(sp);
+    }
+    Ok(())
+}
+
+/// Aborta TODAS las subidas en progreso del bucket. Devuelve cuantas abortó.
+pub fn abort_all(cfg: &ConnConfig, rt: &Runtime) -> Result<usize, String> {
+    let list = list_incomplete(cfg, rt)?;
+    let mut n = 0;
+    for u in &list {
+        if abort_upload(cfg, rt, &u.key, &u.upload_id).is_ok() {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 /// Partes ya subidas segun S3 (fuente de verdad): num -> etag.
 async fn list_uploaded_parts(
     client: &Client,
@@ -124,38 +268,16 @@ impl RemoteSource for S3Source {
         if cfg.endpoint.is_empty() || cfg.bucket.is_empty() {
             return Err("Faltan el endpoint o el bucket.".to_string());
         }
-        let endpoint = cfg.endpoint.clone();
-        let access = cfg.access_key.clone();
-        let secret = cfg.secret_key.clone();
-        let region = if cfg.region.is_empty() {
-            "us-east-1".to_string()
-        } else {
-            cfg.region.clone()
-        };
+        let client = build_client(cfg);
         let bucket = cfg.bucket.clone();
-        let path_style = cfg.path_style;
-
-        let client = self.rt.block_on(async move {
-            let creds = Credentials::new(access, secret, None, None, "carrybox");
-            let conf = aws_sdk_s3::Config::builder()
-                .behavior_version(BehaviorVersion::latest())
-                .region(Region::new(region))
-                .endpoint_url(endpoint)
-                .credentials_provider(creds)
-                .force_path_style(path_style)
-                // Reintentos automaticos con backoff ante errores transitorios
-                // (cortes, 5xx, throttling). Clave para "que nunca deje de subir".
-                .retry_config(RetryConfig::standard().with_max_attempts(6))
-                .build();
-            let client = Client::from_conf(conf);
-            // Pre-flight: valida credenciales + acceso al bucket.
+        // Pre-flight: valida credenciales + acceso al bucket.
+        self.rt.block_on(async {
             client
                 .head_bucket()
                 .bucket(&bucket)
                 .send()
                 .await
-                .map_err(|e| format!("No se pudo acceder al bucket: {}", s3_err(e)))?;
-            Ok::<_, String>(client)
+                .map_err(|e| format!("No se pudo acceder al bucket: {}", s3_err(e)))
         })?;
 
         self.client = Some(client);
@@ -571,8 +693,8 @@ impl RemoteSource for S3Source {
                         .send()
                         .await;
                     let up_ms = tu.elapsed().as_millis();
-                    if up_ms > 900 {
-                        eprintln!("[carrybox] SUBIDA parte {n} ({} KB): {up_ms}ms", len / 1024);
+                    if up_ms > 60000 {
+                        eprintln!("[carrybox] SUBIDA parte {n} MUY LENTA ({} KB): {up_ms}ms", len / 1024);
                     }
                     match res {
                         Ok(u) => (n, Ok(u.e_tag().unwrap_or_default().to_string()), len),

@@ -1117,6 +1117,68 @@ fn delete_secret(key: String) -> Result<(), String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// S3: subidas multipart en progreso (ver / abortar / resetear todo)
+// ---------------------------------------------------------------------------
+
+fn s3_config(state: &AppState) -> Result<ConnConfig, String> {
+    let cfg = state
+        .last_config
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .ok_or("No conectado")?;
+    if cfg.protocol != "s3" {
+        return Err("Disponible solo en modo Subir a S3.".to_string());
+    }
+    Ok(cfg)
+}
+
+fn tmp_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn s3_list_incomplete(state: State<'_, AppState>) -> Result<Vec<s3::IncompleteUpload>, String> {
+    let cfg = s3_config(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let rt = tmp_runtime()?;
+        s3::list_incomplete(&cfg, &rt)
+    })
+    .await
+    .map_err(|e| format!("tarea fallo: {e}"))?
+}
+
+#[tauri::command]
+async fn s3_abort_upload(
+    state: State<'_, AppState>,
+    key: String,
+    upload_id: String,
+) -> Result<(), String> {
+    let cfg = s3_config(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let rt = tmp_runtime()?;
+        s3::abort_upload(&cfg, &rt, &key, &upload_id)
+    })
+    .await
+    .map_err(|e| format!("tarea fallo: {e}"))?
+}
+
+#[tauri::command]
+async fn s3_abort_all(state: State<'_, AppState>) -> Result<usize, String> {
+    let cfg = s3_config(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let rt = tmp_runtime()?;
+        s3::abort_all(&cfg, &rt)
+    })
+    .await
+    .map_err(|e| format!("tarea fallo: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Capturar el log de suppaftp para reenviarlo a la UI.
@@ -1161,7 +1223,10 @@ pub fn run() {
             local_delete,
             save_secret,
             load_secret,
-            delete_secret
+            delete_secret,
+            s3_list_incomplete,
+            s3_abort_upload,
+            s3_abort_all
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

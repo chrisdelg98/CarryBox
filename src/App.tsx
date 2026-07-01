@@ -125,6 +125,17 @@ export default function App() {
   const [pathStyle, setPathStyle] = useState<boolean>((prefs0.pathStyle as boolean) ?? true);
   const [remember, setRemember] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // Ventana de "subidas en progreso" (multipart S3).
+  type IncompleteUpload = {
+    key: string;
+    upload_id: string;
+    bytes: number;
+    parts: number;
+    initiated: number | null;
+  };
+  const [showUploads, setShowUploads] = useState(false);
+  const [incompleteUploads, setIncompleteUploads] = useState<IncompleteUpload[] | null>(null);
+  const [uploadsLoading, setUploadsLoading] = useState(false);
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -511,6 +522,44 @@ export default function App() {
     }
   }
 
+  // ---- Subidas en progreso (multipart S3) ----
+  async function openUploadsPanel() {
+    setShowUploads(true);
+    setUploadsLoading(true);
+    setIncompleteUploads(null);
+    try {
+      const list = await invoke<IncompleteUpload[]>("s3_list_incomplete");
+      setIncompleteUploads(list);
+    } catch (e) {
+      addLog("error", `${e}`);
+      setIncompleteUploads([]);
+    } finally {
+      setUploadsLoading(false);
+    }
+  }
+  async function abortUpload(u: IncompleteUpload) {
+    const ok = await askConfirm(
+      `¿Abortar la subida en progreso de "${u.key}"? Se borrarán los ${fmtSize(u.bytes)} ya subidos al servidor.`,
+    );
+    if (!ok) return;
+    await invoke("s3_abort_upload", { key: u.key, uploadId: u.upload_id }).catch((e) =>
+      addLog("error", `${e}`),
+    );
+    openUploadsPanel();
+  }
+  async function abortAllUploads() {
+    const ok = await askConfirm(
+      "¿RESETEAR TODO? Se abortarán TODAS las subidas en progreso y se borrará su avance en el servidor. No se puede deshacer.",
+    );
+    if (!ok) return;
+    const n = await invoke<number>("s3_abort_all").catch((e) => {
+      addLog("error", `${e}`);
+      return 0;
+    });
+    addLog("status", `Reseteo: ${n} subida(s) en progreso abortada(s).`);
+    openUploadsPanel();
+  }
+
   // ---- Acciones de gestión ----
   async function remoteNewFolder() {
     const name = await askText("Nombre de la nueva carpeta (remota):", "nueva carpeta");
@@ -775,6 +824,15 @@ export default function App() {
           </span>
         </label>
 
+        {mode === "s3" && connected && (
+          <button
+            className="mt-1.5 flex items-center gap-1.5 text-xs text-sky-400 hover:text-sky-300"
+            onClick={openUploadsPanel}
+          >
+            <Icon name="upload" className="h-3.5 w-3.5" /> Ver subidas en progreso / resetear
+          </button>
+        )}
+
         {showAdvanced && (
           <div className="mt-2 flex flex-wrap items-center gap-4 border-t border-slate-700 pt-2 text-xs text-slate-300">
             {mode === "s3" ? (
@@ -982,6 +1040,71 @@ export default function App() {
             ),
           )}
         </ul>
+      )}
+
+      {/* Ventana: subidas en progreso (multipart S3) */}
+      {showUploads && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+          onClick={() => setShowUploads(false)}
+        >
+          <div
+            className="flex max-h-[80vh] w-160 flex-col rounded-lg border border-slate-600 bg-slate-800 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-slate-700 px-4 py-3">
+              <span className="text-sm font-semibold text-slate-100">
+                Subidas en progreso (aún no visibles en el bucket)
+              </span>
+              <button className="btn-mini" onClick={openUploadsPanel} title="Actualizar">
+                ↻
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto p-4">
+              {uploadsLoading ? (
+                <div className="py-8 text-center text-sm text-slate-400">Consultando al servidor…</div>
+              ) : !incompleteUploads || incompleteUploads.length === 0 ? (
+                <div className="py-8 text-center text-sm text-slate-500">
+                  No hay subidas en progreso. Todo limpio ✅
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {incompleteUploads.map((u) => (
+                    <div
+                      key={u.upload_id}
+                      className="flex items-center gap-3 rounded border border-slate-700 bg-slate-900/50 px-3 py-2"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm text-slate-200" title={u.key}>
+                          {u.key}
+                        </div>
+                        <div className="text-xs text-slate-400">
+                          {fmtSize(u.bytes)} subidos · {u.parts} pedazos
+                          {u.initiated ? ` · iniciada ${fmtDate(u.initiated)}` : ""}
+                        </div>
+                      </div>
+                      <button className="btn btn-danger shrink-0" onClick={() => abortUpload(u)}>
+                        Abortar
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="flex items-center justify-between border-t border-slate-700 px-4 py-3">
+              <button
+                className="btn btn-danger"
+                onClick={abortAllUploads}
+                disabled={!incompleteUploads || incompleteUploads.length === 0}
+              >
+                Resetear todo (abortar todas)
+              </button>
+              <button className="btn btn-secondary" onClick={() => setShowUploads(false)}>
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Modal prompt/confirm */}
