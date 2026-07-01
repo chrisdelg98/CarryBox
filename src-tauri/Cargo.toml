@@ -37,5 +37,7 @@ log = "0.4"
 # NASM (a diferencia del default aws-lc-rs). Mantiene el build sin herramientas extra.
 russh = { version = "0.61", default-features = false, features = ["ring"] }
 russh-sftp = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros", "fs"] }
+# Modo Subir a S3: cliente S3-compatible (JetBackup). endpoint custom + path-style.
+aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
 

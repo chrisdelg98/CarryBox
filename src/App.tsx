@@ -107,13 +107,22 @@ function savePrefs(patch: Record<string, unknown>) {
 
 export default function App() {
   type Protocol = "sftp" | "ftp" | "ftps";
+  type Mode = "download" | "s3";
   const prefs0 = useRef(loadPrefs()).current;
+  const [mode, setMode] = useState<Mode>((prefs0.mode as Mode) ?? "download");
   const [protocol, setProtocol] = useState<Protocol>((prefs0.protocol as Protocol) ?? "sftp");
   const [host, setHost] = useState<string>((prefs0.host as string) ?? "");
   const [port, setPort] = useState<number>((prefs0.port as number) ?? 22);
   const [username, setUsername] = useState<string>((prefs0.username as string) ?? "");
   const [password, setPassword] = useState("");
   const [passive, setPassive] = useState<boolean>((prefs0.passive as boolean) ?? true);
+  // --- Campos S3 ---
+  const [endpoint, setEndpoint] = useState<string>((prefs0.endpoint as string) ?? "");
+  const [accessKey, setAccessKey] = useState<string>((prefs0.accessKey as string) ?? "");
+  const [secretKey, setSecretKey] = useState(""); // no se persiste
+  const [bucket, setBucket] = useState<string>((prefs0.bucket as string) ?? "");
+  const [region, setRegion] = useState<string>((prefs0.region as string) ?? "us-east-1");
+  const [pathStyle, setPathStyle] = useState<boolean>((prefs0.pathStyle as boolean) ?? true);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -247,10 +256,22 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Guardar preferencias de conexion (sin contrasena) cuando cambian.
+  // Guardar preferencias de conexion (sin secretos) cuando cambian.
   useEffect(() => {
-    savePrefs({ protocol, host, port, username, passive });
-  }, [protocol, host, port, username, passive]);
+    savePrefs({
+      mode,
+      protocol,
+      host,
+      port,
+      username,
+      passive,
+      endpoint,
+      accessKey,
+      bucket,
+      region,
+      pathStyle,
+    });
+  }, [mode, protocol, host, port, username, passive, endpoint, accessKey, bucket, region, pathStyle]);
 
   function changeProtocol(p: Protocol) {
     setProtocol(p);
@@ -273,15 +294,31 @@ export default function App() {
   }
 
   async function connect() {
-    if (!host) {
-      addLog("error", "Falta el host.");
-      return;
+    let config: Record<string, unknown>;
+    if (mode === "s3") {
+      if (!endpoint || !bucket) {
+        addLog("error", "Faltan el endpoint o el bucket.");
+        return;
+      }
+      config = {
+        protocol: "s3",
+        endpoint,
+        access_key: accessKey,
+        secret_key: secretKey,
+        bucket,
+        region,
+        path_style: pathStyle,
+      };
+    } else {
+      if (!host) {
+        addLog("error", "Falta el host.");
+        return;
+      }
+      config = { protocol, host, port, username, password, passive };
     }
     setBusy(true);
     try {
-      const cwd = await invoke<string>("remote_connect", {
-        config: { protocol, host, port, username, password, passive },
-      });
+      const cwd = await invoke<string>("remote_connect", { config });
       setConnected(true);
       await openRemote(cwd || "/");
     } catch {
@@ -444,7 +481,11 @@ export default function App() {
       acts.push({ icon: "refresh", label: "Actualizar", onClick: () => openRemote(remotePath) });
     } else {
       if (row) {
-        acts.push({ icon: "upload", label: "Subir al servidor", onClick: () => uploadItems([row]) });
+        acts.push({
+          icon: "upload",
+          label: mode === "s3" ? "Subir al bucket S3" : "Subir al servidor",
+          onClick: () => uploadItems([row]),
+        });
         acts.push({ icon: "pencil", label: "Renombrar", onClick: () => localRename(row) });
         acts.push({ icon: "trash", label: "Eliminar", onClick: () => localDelete(row), danger: true });
         acts.push({ sep: true });
@@ -492,54 +533,113 @@ export default function App() {
             <Icon name="github" className="h-5 w-5" />
           </button>
         </div>
-        <div className="flex items-end gap-2">
-          <Field label="Protocolo" className="shrink-0">
-            <select
-              className="select w-60"
-              value={protocol}
-              onChange={(e) => changeProtocol(e.target.value as Protocol)}
+        {/* Conmutador de modo */}
+        <div className="mb-2 flex gap-1 border-b border-slate-700">
+          {(["download", "s3"] as Mode[]).map((m) => (
+            <button
+              key={m}
+              onClick={() => !connected && setMode(m)}
               disabled={connected}
+              className={`-mb-px rounded-t-md border-b-2 px-4 py-1.5 text-sm font-medium transition-colors ${
+                mode === m
+                  ? "border-sky-400 text-sky-400"
+                  : "border-transparent text-slate-400 hover:text-slate-200 disabled:opacity-50"
+              }`}
             >
-              <option value="sftp">SFTP (SSH) · recomendado</option>
-              <option value="ftp">FTP</option>
-              <option value="ftps">FTPS (cifrado)</option>
-            </select>
-          </Field>
-          <Field label="Servidor (host)" className="min-w-0 flex-2">
-            <input
-              className="input w-full"
-              value={host}
-              placeholder="midominio.com o IP"
-              onChange={(e) => setHost(e.target.value)}
-              disabled={connected}
-            />
-          </Field>
-          <Field label="Usuario" className="min-w-0 flex-1">
-            <input
-              className="input w-full"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              disabled={connected}
-            />
-          </Field>
-          <Field label="Contrasena" className="min-w-0 flex-1">
-            <input
-              type="password"
-              className="input w-full"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              disabled={connected}
-            />
-          </Field>
-          <Field label="Puerto" className="shrink-0">
-            <input
-              type="number"
-              className="input w-20"
-              value={port}
-              onChange={(e) => setPort(Number(e.target.value) || 21)}
-              disabled={connected}
-            />
-          </Field>
+              {m === "download" ? "Descargar del servidor" : "Subir a S3"}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex items-end gap-2">
+          {mode === "s3" ? (
+            <>
+              <Field label="Endpoint" className="min-w-0 flex-2">
+                <input
+                  className="input w-full"
+                  value={endpoint}
+                  placeholder="https://s3.tuservidor.com"
+                  onChange={(e) => setEndpoint(e.target.value)}
+                  disabled={connected}
+                />
+              </Field>
+              <Field label="Access Key" className="min-w-0 flex-1">
+                <input
+                  className="input w-full"
+                  value={accessKey}
+                  onChange={(e) => setAccessKey(e.target.value)}
+                  disabled={connected}
+                />
+              </Field>
+              <Field label="Secret Key" className="min-w-0 flex-1">
+                <input
+                  type="password"
+                  className="input w-full"
+                  value={secretKey}
+                  onChange={(e) => setSecretKey(e.target.value)}
+                  disabled={connected}
+                />
+              </Field>
+              <Field label="Bucket" className="shrink-0">
+                <input
+                  className="input w-44"
+                  value={bucket}
+                  onChange={(e) => setBucket(e.target.value)}
+                  disabled={connected}
+                />
+              </Field>
+            </>
+          ) : (
+            <>
+              <Field label="Protocolo" className="shrink-0">
+                <select
+                  className="select w-60"
+                  value={protocol}
+                  onChange={(e) => changeProtocol(e.target.value as Protocol)}
+                  disabled={connected}
+                >
+                  <option value="sftp">SFTP (SSH) · recomendado</option>
+                  <option value="ftp">FTP</option>
+                  <option value="ftps">FTPS (cifrado)</option>
+                </select>
+              </Field>
+              <Field label="Servidor (host)" className="min-w-0 flex-2">
+                <input
+                  className="input w-full"
+                  value={host}
+                  placeholder="midominio.com o IP"
+                  onChange={(e) => setHost(e.target.value)}
+                  disabled={connected}
+                />
+              </Field>
+              <Field label="Usuario" className="min-w-0 flex-1">
+                <input
+                  className="input w-full"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  disabled={connected}
+                />
+              </Field>
+              <Field label="Contrasena" className="min-w-0 flex-1">
+                <input
+                  type="password"
+                  className="input w-full"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  disabled={connected}
+                />
+              </Field>
+              <Field label="Puerto" className="shrink-0">
+                <input
+                  type="number"
+                  className="input w-20"
+                  value={port}
+                  onChange={(e) => setPort(Number(e.target.value) || 21)}
+                  disabled={connected}
+                />
+              </Field>
+            </>
+          )}
           <div className="flex shrink-0 items-end gap-2">
             {!connected ? (
               <button className="btn btn-primary w-36" onClick={connect} disabled={busy}>
@@ -562,7 +662,28 @@ export default function App() {
 
         {showAdvanced && (
           <div className="mt-2 flex flex-wrap items-center gap-4 border-t border-slate-700 pt-2 text-xs text-slate-300">
-            {protocol === "sftp" ? (
+            {mode === "s3" ? (
+              <>
+                <label className="flex items-center gap-1.5">
+                  Región
+                  <input
+                    className="input h-7 w-32 py-0"
+                    value={region}
+                    onChange={(e) => setRegion(e.target.value)}
+                    disabled={connected}
+                  />
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input
+                    type="checkbox"
+                    checked={pathStyle}
+                    onChange={(e) => setPathStyle(e.target.checked)}
+                    disabled={connected}
+                  />
+                  Path-style (necesario en S3 no-AWS como JetBackup)
+                </label>
+              </>
+            ) : protocol === "sftp" ? (
               <span className="text-slate-500">
                 SFTP usa una sola conexion (puerto 22); no necesita modo pasivo.
               </span>
@@ -603,7 +724,7 @@ export default function App() {
         </Pane>
 
         <Pane
-          title="Remoto (servidor)"
+          title={mode === "s3" ? `Bucket S3${bucket ? " · " + bucket : ""}` : "Remoto (servidor)"}
           side="remote"
           onDrop={() => onDropTo("remote")}
           onContextMenu={(e) => connected && onRowContextMenu(e, "remote", null)}

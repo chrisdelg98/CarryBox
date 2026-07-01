@@ -90,15 +90,34 @@ fn default_true() -> bool {
 /// Datos de conexion que llegan desde la UI.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConnConfig {
-    /// "sftp" | "ftp" | "ftps"
+    /// "sftp" | "ftp" | "ftps" | "s3"
     pub protocol: String,
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
     pub port: u16,
+    #[serde(default)]
     pub username: String,
+    #[serde(default)]
     pub password: String,
     /// Modo pasivo (solo FTP/FTPS). Por defecto activado.
     #[serde(default = "default_true")]
     pub passive: bool,
+
+    // --- Campos S3 (solo cuando protocol == "s3") ---
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub access_key: String,
+    #[serde(default)]
+    pub secret_key: String,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default)]
+    pub region: String,
+    /// path-style addressing (clave para S3 no-AWS como JetBackup). Por defecto true.
+    #[serde(default = "default_true")]
+    pub path_style: bool,
 }
 
 /// Un elemento dentro de una carpeta remota.

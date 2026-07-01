@@ -1,6 +1,8 @@
 mod remote;
+mod s3;
 
 use remote::{CancelHandle, ConnConfig, FtpSource, RemoteEntry, RemoteSource, SftpSource};
+use s3::S3Source;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +29,7 @@ fn make_source(cfg: &ConnConfig, cancel: &CancelHandle) -> Result<Box<dyn Remote
     match cfg.protocol.as_str() {
         "ftp" | "ftps" => Ok(Box::new(FtpSource::new(cancel.clone()))),
         "sftp" => Ok(Box::new(SftpSource::new()?)),
+        "s3" => Ok(Box::new(S3Source::new()?)),
         other => Err(format!("Protocolo no soportado: {other}")),
     }
 }
