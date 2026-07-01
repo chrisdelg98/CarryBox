@@ -40,4 +40,7 @@ russh-sftp = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros", "fs"] }
 # Modo Subir a S3: cliente S3-compatible (JetBackup). endpoint custom + path-style.
 aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
+# Credenciales cifradas (SecretStore): en Windows usa el Administrador de credenciales
+# (DPAPI por debajo); multiplataforma (macOS Keychain / Linux Secret Service).
+keyring = "4"
 

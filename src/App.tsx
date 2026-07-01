@@ -123,6 +123,7 @@ export default function App() {
   const [bucket, setBucket] = useState<string>((prefs0.bucket as string) ?? "");
   const [region, setRegion] = useState<string>((prefs0.region as string) ?? "us-east-1");
   const [pathStyle, setPathStyle] = useState<boolean>((prefs0.pathStyle as boolean) ?? true);
+  const [remember, setRemember] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -278,6 +279,26 @@ export default function App() {
     setPort(p === "sftp" ? 22 : 21);
   }
 
+  // Cargar credencial guardada (segura) al iniciar y al cambiar de modo.
+  useEffect(() => {
+    let cancelled = false;
+    invoke<string | null>("load_secret", { key: `carrybox:${mode}` })
+      .then((s) => {
+        if (cancelled) return;
+        if (s) {
+          if (mode === "s3") setSecretKey(s);
+          else setPassword(s);
+          setRemember(true);
+        } else {
+          setRemember(false);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [mode]);
+
   async function loadLocal(path: string | null) {
     try {
       const dir = await invoke<LocalDir>("list_local", { path });
@@ -320,6 +341,16 @@ export default function App() {
     try {
       const cwd = await invoke<string>("remote_connect", { config });
       setConnected(true);
+      // Guardar/olvidar la credencial segura segun el checkbox.
+      const secretName = `carrybox:${mode}`;
+      const secretVal = mode === "s3" ? secretKey : password;
+      if (remember && secretVal) {
+        invoke("save_secret", { key: secretName, value: secretVal }).catch((e) =>
+          addLog("error", `No se pudo guardar la credencial: ${e}`),
+        );
+      } else if (!remember) {
+        invoke("delete_secret", { key: secretName }).catch(() => {});
+      }
       await openRemote(cwd || "/");
     } catch {
       setConnected(false);
@@ -660,6 +691,19 @@ export default function App() {
           </div>
         </div>
 
+        <label className="mt-2 flex w-fit items-center gap-1.5 text-xs text-slate-300">
+          <input
+            type="checkbox"
+            checked={remember}
+            onChange={(e) => setRemember(e.target.checked)}
+            disabled={connected}
+          />
+          Recordar credenciales de forma segura
+          <span className="text-slate-500">
+            (se cifran en el Administrador de credenciales de Windows)
+          </span>
+        </label>
+
         {showAdvanced && (
           <div className="mt-2 flex flex-wrap items-center gap-4 border-t border-slate-700 pt-2 text-xs text-slate-300">
             {mode === "s3" ? (
@@ -714,6 +758,7 @@ export default function App() {
             path={localDir?.path ?? ""}
             onUp={() => localDir?.parent && loadLocal(localDir.parent)}
             canUp={!!localDir?.parent}
+            onRoot={() => loadLocal("::drives::")}
           />
           <FileTable
             side="local"
@@ -986,6 +1031,14 @@ function Icon({ name, className = "h-4 w-4" }: { name: string; className?: strin
           <path d="M18 6L6 18M6 6l12 12" />
         </svg>
       );
+    case "hdd":
+      return (
+        <svg {...p}>
+          <path d="M22 12H2" />
+          <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+          <path d="M6 16h.01M10 16h.01" />
+        </svg>
+      );
     case "github":
       return (
         <svg viewBox="0 0 24 24" fill="currentColor" className={className} aria-hidden="true">
@@ -1085,9 +1138,24 @@ function Pane({
   );
 }
 
-function PathBar({ path, onUp, canUp }: { path: string; onUp: () => void; canUp: boolean }) {
+function PathBar({
+  path,
+  onUp,
+  canUp,
+  onRoot,
+}: {
+  path: string;
+  onUp: () => void;
+  canUp: boolean;
+  onRoot?: () => void;
+}) {
   return (
     <div className="flex items-center gap-2 border-b border-slate-700 bg-slate-800/60 px-2 py-1">
+      {onRoot && (
+        <button className="btn-mini flex items-center" onClick={onRoot} title="Equipo (unidades C:, D:, E:…)">
+          <Icon name="hdd" className="h-3.5 w-3.5" />
+        </button>
+      )}
       <button className="btn-mini" onClick={onUp} disabled={!canUp} title="Subir un nivel">
         ↑
       </button>

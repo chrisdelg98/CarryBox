@@ -952,8 +952,48 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// Token especial: vista "Equipo" con las unidades de almacenamiento.
+const DRIVES: &str = "::drives::";
+
+/// Lista las unidades disponibles (C:, D:, E: ...). En *nix, la raiz "/".
+fn list_drives_dir() -> LocalDir {
+    let mut entries = Vec::new();
+    #[cfg(windows)]
+    {
+        for letter in b'A'..=b'Z' {
+            let root = format!("{}:\\", letter as char);
+            if Path::new(&root).exists() {
+                entries.push(LocalEntry {
+                    name: format!("{}:", letter as char),
+                    path: root,
+                    is_dir: true,
+                    size: 0,
+                });
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        entries.push(LocalEntry {
+            name: "/".to_string(),
+            path: "/".to_string(),
+            is_dir: true,
+            size: 0,
+        });
+    }
+    LocalDir {
+        path: "Equipo".to_string(),
+        parent: None,
+        entries,
+    }
+}
+
 #[tauri::command]
 fn list_local(path: Option<String>) -> Result<LocalDir, String> {
+    // Vista especial de unidades.
+    if path.as_deref() == Some(DRIVES) {
+        return Ok(list_drives_dir());
+    }
     let dir = match path {
         Some(p) if !p.is_empty() => PathBuf::from(p),
         _ => home_dir(),
@@ -982,7 +1022,15 @@ fn list_local(path: Option<String>) -> Result<LocalDir, String> {
 
     let parent = Path::new(&dir)
         .parent()
-        .map(|p| p.to_string_lossy().to_string());
+        .map(|p| p.to_string_lossy().to_string())
+        .or_else(|| {
+            // En la raiz de una unidad (C:\), "subir" lleva a la vista de unidades.
+            if cfg!(windows) {
+                Some(DRIVES.to_string())
+            } else {
+                None
+            }
+        });
 
     Ok(LocalDir {
         path: dir.to_string_lossy().to_string(),
@@ -1012,6 +1060,40 @@ fn local_delete(path: String, is_dir: bool) -> Result<(), String> {
         std::fs::remove_dir_all(&p).map_err(|e| format!("No se pudo eliminar la carpeta: {e}"))
     } else {
         std::fs::remove_file(&p).map_err(|e| format!("No se pudo eliminar el archivo: {e}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SecretStore: credenciales cifradas via keyring (Windows Credential Manager /
+// macOS Keychain / Linux Secret Service). Guarda el secreto (password/secret key).
+// ---------------------------------------------------------------------------
+
+fn secret_entry(key: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new("CarryBox", key).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_secret(key: String, value: String) -> Result<(), String> {
+    secret_entry(&key)?
+        .set_password(&value)
+        .map_err(|e| format!("No se pudo guardar la credencial: {e}"))
+}
+
+#[tauri::command]
+fn load_secret(key: String) -> Result<Option<String>, String> {
+    match secret_entry(&key)?.get_password() {
+        Ok(v) => Ok(Some(v)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("No se pudo leer la credencial: {e}")),
+    }
+}
+
+#[tauri::command]
+fn delete_secret(key: String) -> Result<(), String> {
+    match secret_entry(&key)?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("No se pudo borrar la credencial: {e}")),
     }
 }
 
@@ -1056,7 +1138,10 @@ pub fn run() {
             list_local,
             local_mkdir,
             local_rename,
-            local_delete
+            local_delete,
+            save_secret,
+            load_secret,
+            delete_secret
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
